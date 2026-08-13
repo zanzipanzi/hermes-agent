@@ -18,6 +18,7 @@ they carry no durable row, so parking them would leak.
 """
 
 import queue
+import time
 from unittest.mock import patch
 
 import pytest
@@ -185,3 +186,60 @@ class TestPendingSweep:
                    side_effect=RuntimeError("db locked")):
             assert _sweep_pending_delegations("42323a59", _session(), q) == 0
         assert q.empty()
+
+
+class TestClaimLossReleasesSession:
+    """Losing the durable claim must not strand ``session['running']``.
+
+    The poller marks the session busy *before* claiming. When another consumer
+    already delivered the row, ``claim_event_delivery`` returns None and the
+    loop moves on -- but the busy flag it just set has to come back off, or the
+    poller re-queues every subsequent event forever and the session never
+    accepts another completion.
+
+    The recovery sweep makes this path routine rather than rare: at process
+    start ``restore_undelivered_completions`` and the session's first sweep
+    each enqueue a copy of every pending row, so the second copy reliably
+    loses the claim.
+    """
+
+    def test_running_is_cleared_when_claim_is_lost(self):
+        import threading
+
+        from tools.process_registry import process_registry
+        import tui_gateway.server as srv
+
+        stop = threading.Event()
+        session = {
+            "session_key": "20260812_220219_8b4822",
+            "_finalized": False,
+            "running": False,
+            "history_lock": threading.RLock(),
+        }
+        process_registry.completion_queue.put(_evt())
+
+        with patch.object(srv, "_collect_kanban_notifications", return_value=[]), \
+             patch.object(srv, "_session_owns_notification_event", return_value=True), \
+             patch.object(srv, "_emit"), \
+             patch.object(srv, "_run_prompt_submit"), \
+             patch("tools.async_delegation.pending_completion_events", return_value=[]), \
+             patch("tools.async_delegation.claim_event_delivery", return_value=None), \
+             patch("tools.process_registry.format_process_notification",
+                   return_value="[ASYNC DELEGATION BATCH COMPLETE]"):
+            t = threading.Thread(
+                target=srv._notification_poller_loop,
+                args=(stop, "42323a59", session),
+                daemon=True,
+            )
+            t.start()
+            deadline = time.time() + 5
+            while time.time() < deadline and not process_registry.completion_queue.empty():
+                time.sleep(0.05)
+            time.sleep(0.3)
+            stop.set()
+            t.join(timeout=5)
+
+        assert session["running"] is False, (
+            "poller set running=True before claiming, lost the claim, and "
+            "never released the session"
+        )
