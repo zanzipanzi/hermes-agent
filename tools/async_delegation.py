@@ -354,18 +354,47 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
+    events = pending_completion_events()
+    for evt in events:
+        target_queue.put(evt)
+    return len(events)
+
+
+def pending_completion_events() -> List[Dict[str, Any]]:
+    """Return every durable completion still awaiting delivery, oldest first.
+
+    The durable row is the only authoritative record that a result is still
+    owed to someone. In-memory queue copies get lost — a foreign poller can
+    dequeue one, a process can exit mid-turn — and until a consumer *claims*
+    the row, nothing about it changes. Exposing the pending set lets a live
+    session re-derive what it is still owed instead of depending on a single
+    fragile in-memory copy handed out once at process start.
+
+    Every event is stamped ``restored=True`` in memory only; the stamp is
+    never persisted. Re-enqueuing an event that is already queued is safe:
+    ``claim_completion_delivery`` admits exactly one consumer per row, so the
+    duplicate loses the claim and is discarded.
+    """
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT delegation_id, event_json FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
+    events: List[Dict[str, Any]] = []
+    for delegation_id, payload in rows:
+        try:
             evt = json.loads(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
-            target_queue.put(evt)
-    return len(rows)
+        except Exception:
+            logger.warning(
+                "Pending delegation %s has unparseable event_json; skipping",
+                delegation_id,
+            )
+            continue
+        if isinstance(evt, dict):
+            evt["restored"] = True
+            events.append(evt)
+    return events
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
