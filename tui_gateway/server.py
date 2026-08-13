@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
@@ -8794,6 +8795,141 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+# --- Orphaned async-delegation parking -------------------------------------
+#
+# ``restore_undelivered_completions`` rehydrates EVERY pending durable row into
+# the booting process's queue with no session filter, so a freshly opened pane
+# routinely dequeues completions commissioned by a different session. Those must
+# never be injected here (#55578) — but *destroying* them stranded real results:
+# the durable row stays 'pending' with delivery_attempts=0, invisible to the
+# retry budget and to the terminal 'dropped' disposition, and the only retry is
+# another process start, which repeats the same drop.
+#
+# Park them instead, so the session that provably owns them reclaims them
+# in-process. The shutdown drain below already behaves this way; this is the
+# live loop catching up to it.
+_ORPHANED_DELEGATION_LIMIT = 256
+_orphaned_delegations: "OrderedDict[str, dict]" = OrderedDict()
+_orphaned_delegations_lock = threading.Lock()
+
+
+def _should_park_unowned_notification(evt: dict) -> bool:
+    """Whether an unowned notification is worth holding for its real owner.
+
+    Only async-delegation completions qualify: they alone have a durable
+    ``async_delegations`` row, so parking is a bounded hold on data that
+    already exists rather than a leak. Ordinary process notifications keep the
+    existing drop behavior.
+    """
+    return evt.get("type") == "async_delegation" and bool(
+        str(evt.get("delegation_id") or "")
+    )
+
+
+def _park_orphaned_delegation(evt: dict) -> None:
+    """Hold an unowned delegation completion for the session that owns it."""
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return
+    with _orphaned_delegations_lock:
+        # Re-parking refreshes recency without duplicating — the same orphan is
+        # re-dequeued by every foreign poller until someone claims it.
+        _orphaned_delegations.pop(delegation_id, None)
+        _orphaned_delegations[delegation_id] = evt
+        while len(_orphaned_delegations) > _ORPHANED_DELEGATION_LIMIT:
+            evicted_id, _ = _orphaned_delegations.popitem(last=False)
+            logger.warning(
+                "Orphaned delegation park is full (%d); evicting %s. Its "
+                "durable row stays pending and is recoverable from state.db.",
+                _ORPHANED_DELEGATION_LIMIT, evicted_id,
+            )
+
+
+def _reclaim_orphaned_delegations(sid: str, session: dict) -> list[dict]:
+    """Return parked completions ``session`` PROVABLY owns, removing them.
+
+    Ownership uses the same fail-closed predicate as delivery, so a pane can
+    only ever reclaim its own work. The predicate can touch the DB, so it runs
+    outside the lock; a concurrent reclaim simply loses the ``pop`` race and
+    returns fewer events rather than delivering one twice.
+    """
+    if session.get("_finalized"):
+        return []
+    with _orphaned_delegations_lock:
+        if not _orphaned_delegations:
+            return []
+        snapshot = list(_orphaned_delegations.items())
+    owned_ids = [
+        delegation_id
+        for delegation_id, evt in snapshot
+        if _session_owns_notification_event(sid, session, evt)
+    ]
+    if not owned_ids:
+        return []
+    reclaimed = []
+    with _orphaned_delegations_lock:
+        for delegation_id in owned_ids:
+            evt = _orphaned_delegations.pop(delegation_id, None)
+            if evt is not None:
+                reclaimed.append(evt)
+    return reclaimed
+
+
+def _reset_orphaned_delegations_for_tests() -> None:
+    with _orphaned_delegations_lock:
+        _orphaned_delegations.clear()
+
+
+def _sweep_pending_delegations(
+    sid: str, session: dict, target_queue: "queue.Queue",
+) -> int:
+    """Re-enqueue durable completions this session owns but never received.
+
+    The durable row is the authoritative record of a result still owed. An
+    in-memory queue copy is not: a foreign poller can dequeue it, a process
+    can exit mid-turn, and until someone *claims* the row nothing about it
+    changes — so a lost copy previously meant the result was never delivered
+    again, with no signal anywhere.
+
+    Sweeping the pending set makes delivery self-healing regardless of how a
+    copy was lost. Re-enqueuing something already queued is safe:
+    ``claim_completion_delivery`` admits exactly one consumer per row, so a
+    duplicate simply loses the claim and is discarded by the poller.
+
+    Skipped while the session is mid-turn: nothing can be injected then
+    anyway, and sweeping regardless would pile a fresh copy of every owed
+    result onto the queue each minute for as long as the turn runs.
+
+    Returns the number of events re-enqueued. Never raises — a failed sweep
+    must not take down the poller thread.
+    """
+    if session.get("_finalized") or session.get("running"):
+        return 0
+    try:
+        from tools.async_delegation import pending_completion_events
+
+        events = pending_completion_events()
+    except Exception as exc:
+        logger.debug("Pending delegation sweep failed: %s", exc)
+        return 0
+
+    swept = 0
+    for evt in events:
+        try:
+            if not _session_owns_notification_event(sid, session, evt):
+                continue
+            target_queue.put(evt)
+            swept += 1
+        except Exception as exc:
+            logger.debug("Pending delegation sweep skipped an event: %s", exc)
+    if swept:
+        logger.info(
+            "Re-enqueued %d undelivered delegation completion(s) owned by "
+            "session %s", swept, sid,
+        )
+    return swept
+
+
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """Return the UI-emission identity for a process notification event.
 
@@ -8840,6 +8976,11 @@ _KANBAN_NOTIFY_KINDS = (
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
+# How often a live session re-derives, from the durable rows, which delegation
+# completions it is still owed. Slow on purpose: the queue is the fast path and
+# this is only the safety net for a copy that went missing, so the cost is one
+# indexed read per session per minute.
+_PENDING_DELEGATION_SWEEP_SECONDS = 60.0
 
 
 def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
@@ -9019,6 +9160,7 @@ def _notification_poller_loop(
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
+    _last_delegation_sweep = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
@@ -9059,6 +9201,26 @@ def _notification_poller_loop(
                         )
                         with session["history_lock"]:
                             session["running"] = False
+        # Safety net for a queue copy that went missing: re-derive what this
+        # session is still owed straight from the durable rows.
+        if _now - _last_delegation_sweep >= _PENDING_DELEGATION_SWEEP_SECONDS:
+            _last_delegation_sweep = _now
+            _sweep_pending_delegations(
+                sid, session, process_registry.completion_queue,
+            )
+
+        # Reclaim any completion another session's poller dequeued and parked
+        # because it could not prove ownership. Cheap when the park is empty,
+        # which is the overwhelmingly common case.
+        if _orphaned_delegations:
+            for _reclaimed in _reclaim_orphaned_delegations(sid, session):
+                logger.info(
+                    "Reclaiming parked async_delegation %s for its owning "
+                    "session %s",
+                    str(_reclaimed.get("delegation_id") or ""), sid,
+                )
+                process_registry.completion_queue.put(_reclaimed)
+
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -9081,19 +9243,27 @@ def _notification_poller_loop(
         # ownerless ordinary notifications retain legacy global delivery.
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            log = (
-                logger.warning
-                if evt.get("type") == "async_delegation"
-                else logger.debug
-            )
-            log(
-                "Dropping unowned %s notification (origin=%r key=%r) instead "
-                "of delivering to session %s",
-                evt.get("type", "completion"),
-                str(evt.get("origin_ui_session_id") or ""),
-                str(evt.get("session_key") or ""),
-                sid,
-            )
+            if _should_park_unowned_notification(evt):
+                # Durable delegation result: hold it for the session that
+                # commissioned it instead of destroying it here.
+                _park_orphaned_delegation(evt)
+                logger.info(
+                    "Parking unowned async_delegation %s (origin=%r key=%r) "
+                    "for its owner instead of delivering to session %s",
+                    str(evt.get("delegation_id") or ""),
+                    str(evt.get("origin_ui_session_id") or ""),
+                    str(evt.get("session_key") or ""),
+                    sid,
+                )
+            else:
+                logger.debug(
+                    "Dropping unowned %s notification (origin=%r key=%r) instead "
+                    "of delivering to session %s",
+                    evt.get("type", "completion"),
+                    str(evt.get("origin_ui_session_id") or ""),
+                    str(evt.get("session_key") or ""),
+                    sid,
+                )
             continue
 
         _evt_sid = evt.get("session_id", "")
