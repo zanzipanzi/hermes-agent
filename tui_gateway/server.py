@@ -9303,6 +9303,14 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            # Another consumer already took this row. We marked the session
+            # busy for a turn we are not going to run, so hand it back —
+            # otherwise this poller re-queues every future event forever and
+            # the session never accepts another completion. Duplicate copies
+            # are routine (process-start restore and the recovery sweep each
+            # enqueue one), so this path is normal, not exceptional.
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
