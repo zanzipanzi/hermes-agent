@@ -9759,6 +9759,24 @@ def test_interrupt_drops_queued_prompt_for_session():
         server._sessions.pop("sid", None)
 
 
+def test_cancel_latch_blocks_queued_prompt_drain(monkeypatch):
+    calls = []
+    queued = {"text": "must not run", "transport": None}
+    session = _session(
+        running=False,
+        queued_prompt=queued,
+        _turn_cancel_requested=True,
+    )
+    monkeypatch.setattr(
+        server, "_run_prompt_submit", lambda *args, **kwargs: calls.append(args)
+    )
+
+    assert server._drain_queued_prompt("1", "sid", session) is False
+    assert session["queued_prompt"] == queued
+    assert session["running"] is False
+    assert calls == []
+
+
 def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
     """Stop during lazy agent startup must not start the turn after init finishes."""
     threads = []
@@ -13974,6 +13992,44 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         assert requeued["session_id"] == "proc_busy_test"
     finally:
         server._sessions.pop("sid_busy", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_requeues_while_cancel_latched(monkeypatch):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    emitted = []
+    turns = []
+    sess = _session(running=False, _turn_cancel_requested=True)
+    server._sessions["sid_cancelled"] = sess
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
+    monkeypatch.setattr(
+        server, "_run_prompt_submit", lambda *a, **kw: turns.append(a)
+    )
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    evt = {
+        "type": "completion",
+        "session_id": "proc_cancelled_test",
+        "command": "make build",
+        "exit_code": 0,
+        "output": "ok",
+    }
+    isolated_queue.put(evt)
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_cancelled", sess)
+        assert turns == []
+        assert not isolated_queue.empty()
+        assert isolated_queue.get_nowait() == evt
+        assert not [call for call in emitted if call[0] == "message.start"]
+    finally:
+        server._sessions.pop("sid_cancelled", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
 

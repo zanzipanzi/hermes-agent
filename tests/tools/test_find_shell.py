@@ -9,6 +9,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from unittest.mock import patch
 
 import pytest
@@ -135,15 +136,143 @@ class TestGitBashExternalProgramProbe:
         local_mod._bash_probe_details_cache.clear()
         calls = []
 
-        def fake_run(argv, **kwargs):
+        def fake_probe(argv, **kwargs):
             calls.append((argv, kwargs))
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(local_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(local_mod, "bounded_process_probe", fake_probe)
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
 
         assert local_mod._bash_starts(r"C:\Git\bin\bash.exe") is True
         assert calls[0][0][-1] == "/usr/bin/true; /usr/bin/cat --version >/dev/null"
+
+    def test_rejects_system32_wsl_without_probing_it(self, monkeypatch):
+        import tools.environments.local as local_mod
+
+        local_mod._bash_starts_cache.clear()
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setenv("HERMES_GIT_BASH_PATH", "")
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\missing")
+        monkeypatch.setenv("ProgramFiles", r"C:\missing")
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+        monkeypatch.setattr(local_mod.os.path, "isfile", lambda _path: False)
+        monkeypatch.setattr(
+            local_mod.shutil,
+            "which",
+            lambda _name: r"C:\Windows\System32\bash.exe",
+        )
+        probes = []
+        monkeypatch.setattr(
+            local_mod,
+            "_bash_starts",
+            lambda path: probes.append(path) or True,
+        )
+
+        with pytest.raises(RuntimeError, match="Git Bash not found"):
+            local_mod._find_bash()
+
+        assert probes == []
+
+    def test_configured_bin_shim_canonicalizes_to_usr_bin(
+        self, monkeypatch
+    ):
+        import tools.environments.local as local_mod
+
+        local_mod._bash_starts_cache.clear()
+        shim = r"C:\Program Files\Git\bin\bash.exe"
+        direct = r"C:\Program Files\Git\usr\bin\bash.exe"
+        existing = {os.path.normcase(shim), os.path.normcase(direct)}
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setenv("HERMES_GIT_BASH_PATH", shim)
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\missing")
+        monkeypatch.setenv("ProgramFiles", r"C:\missing")
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+        monkeypatch.setattr(
+            local_mod.os.path,
+            "isfile",
+            lambda path: os.path.normcase(path) in existing,
+        )
+        monkeypatch.setattr(local_mod.shutil, "which", lambda _name: None)
+        probes = []
+        monkeypatch.setattr(
+            local_mod,
+            "_bash_starts",
+            lambda path: probes.append(path) or path == direct,
+        )
+
+        assert local_mod._find_bash() == direct
+        assert probes == [direct]
+
+    def test_candidate_probes_share_one_startup_deadline(self, monkeypatch):
+        import tools.environments.local as local_mod
+
+        local_mod._bash_starts_cache.clear()
+        candidates = {
+            ntpath
+            for ntpath in (
+                r"C:\one\usr\bin\bash.exe",
+                r"C:\two\usr\bin\bash.exe",
+                r"C:\three\usr\bin\bash.exe",
+            )
+        }
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setenv("HERMES_GIT_BASH_PATH", next(iter(candidates)))
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\missing")
+        monkeypatch.setenv("ProgramFiles", r"C:\missing")
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+        monkeypatch.setattr(
+            local_mod.os.path, "isfile", lambda path: path in candidates
+        )
+        remaining = iter(candidates - {os.environ["HERMES_GIT_BASH_PATH"]})
+        monkeypatch.setattr(
+            local_mod.shutil, "which", lambda _name: next(remaining, None)
+        )
+        timeouts = []
+
+        def slow_failure(_path, *, timeout=15):
+            timeouts.append(timeout)
+            time.sleep(min(timeout, 0.15))
+            return False
+
+        monkeypatch.setattr(local_mod, "_bash_starts", slow_failure)
+        started = time.monotonic()
+        with pytest.raises((RuntimeError, TimeoutError)):
+            local_mod._find_bash(deadline=time.monotonic() + 0.2)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.5
+        assert timeouts
+        assert all(0 < timeout <= 0.21 for timeout in timeouts)
+        assert timeouts == sorted(timeouts, reverse=True)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows process trees")
+    def test_bounded_probe_kills_descendant_holding_output_pipe(self, tmp_path):
+        from gateway.status import _pid_exists
+        from hermes_cli._subprocess_compat import bounded_process_probe
+
+        child_pid_file = tmp_path / "child.pid"
+        child_code = "import time; time.sleep(60)"
+        parent_code = (
+            "import pathlib, subprocess, sys, time; "
+            f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid)); "
+            "print('ready', flush=True); time.sleep(60)"
+        )
+
+        started = time.monotonic()
+        result = bounded_process_probe(
+            [sys.executable, "-c", parent_code], timeout=0.5
+        )
+        elapsed = time.monotonic() - started
+
+        assert result is None
+        assert elapsed < 5
+        child_pid = int(child_pid_file.read_text())
+        deadline = time.monotonic() + 3
+        while _pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_exists(child_pid)
 
     def test_aslr_failure_surfaces_targeted_windows_command(
         self, tmp_path, monkeypatch
