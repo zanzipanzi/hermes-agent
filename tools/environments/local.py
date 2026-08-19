@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import bounded_process_probe, windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -719,7 +719,31 @@ def build_subprocess_env(
     return env
 
 
-def _find_bash() -> str:
+def _is_wsl_bash_path(path: str) -> bool:
+    """Return whether *path* is a Windows WSL launcher, not Git Bash."""
+    normalized = ntpath.normcase(ntpath.normpath(path))
+    windows_root = ntpath.normcase(
+        ntpath.normpath(os.environ.get("SystemRoot", r"C:\Windows"))
+    )
+    if normalized in {
+        ntpath.join(windows_root, "system32", "bash.exe"),
+        ntpath.join(windows_root, "sysnative", "bash.exe"),
+    }:
+        return True
+    return "\\microsoft\\windowsapps\\" in normalized
+
+
+def _canonical_git_bash_path(path: str) -> str:
+    """Prefer Git for Windows' direct executable over its ``bin`` shim."""
+    normalized = ntpath.normpath(path)
+    if ntpath.basename(ntpath.dirname(normalized)).lower() != "bin":
+        return normalized
+    root = ntpath.dirname(ntpath.dirname(normalized))
+    direct = ntpath.join(root, "usr", "bin", "bash.exe")
+    return direct if os.path.isfile(direct) else normalized
+
+
+def _find_bash(*, deadline: float | None = None) -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:
         return (
@@ -732,9 +756,18 @@ def _find_bash() -> str:
 
     candidates: list[str] = []
 
+    def add_candidate(path: str) -> None:
+        candidate = _canonical_git_bash_path(path)
+        if _is_wsl_bash_path(candidate):
+            logger.debug("Ignoring WSL bash launcher: %s", candidate)
+            return
+        if candidate not in candidates:
+            candidates.append(candidate)
+
     custom = os.environ.get("HERMES_GIT_BASH_PATH")
     if custom and os.path.isfile(custom):
-        candidates.append(custom)
+        add_candidate(custom)
+    canonical_custom = _canonical_git_bash_path(custom) if custom else None
 
     # Prefer our own portable Git install — a broken or partially-uninstalled
     # system Git (or a stale HERMES_GIT_BASH_PATH pointing at one) must not
@@ -751,8 +784,8 @@ def _find_bash() -> str:
             os.path.join(_hermes_portable_git, "bin", "bash.exe"),        # PortableGit (primary)
             os.path.join(_hermes_portable_git, "usr", "bin", "bash.exe"), # MinGit fallback
         ):
-            if os.path.isfile(candidate) and candidate not in candidates:
-                candidates.append(candidate)
+            if os.path.isfile(candidate):
+                add_candidate(candidate)
 
     # Check known Git for Windows install locations before PATH lookup.
     # On machines with both WSL and Git for Windows, shutil.which("bash")
@@ -763,20 +796,27 @@ def _find_bash() -> str:
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
         os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe") if _local_appdata else "",
     ):
-        if candidate and os.path.isfile(candidate) and candidate not in candidates:
-            candidates.append(candidate)
+        if candidate and os.path.isfile(candidate):
+            add_candidate(candidate)
 
     found = shutil.which("bash")
-    if found and found not in candidates:
-        candidates.append(found)
+    if found:
+        add_candidate(found)
 
     # Prefer the first candidate that can actually start.  A stale
     # HERMES_GIT_BASH_PATH pointing at a broken Git-for-Windows install
     # (``Directory \\drivers\\etc does not exist``) must not win over a
     # healthy portable Git under %LOCALAPPDATA%\\hermes\\git.
     for candidate in candidates:
-        if _bash_starts(candidate):
-            if candidate != custom and custom and os.path.isfile(custom):
+        if deadline is None:
+            starts = _bash_starts(candidate)
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Git Bash discovery exceeded the terminal deadline")
+            starts = _bash_starts(candidate, timeout=min(15, remaining))
+        if starts:
+            if candidate != canonical_custom and custom and os.path.isfile(custom):
                 logger.warning(
                     "HERMES_GIT_BASH_PATH=%s fails to start; using %s instead",
                     custom,
@@ -795,10 +835,10 @@ def _find_bash() -> str:
         ):
             raise RuntimeError(_git_bash_aslr_help(candidates[0], probe_details))
 
-        # Last resort for failures unrelated to the known MSYS/ASLR class:
-        # return the first path so the caller still sees the real bash error
-        # instead of the less useful "not found" message.
-        return candidates[0]
+        raise RuntimeError(
+            "No usable Git Bash installation passed Hermes' capability probe. "
+            "Set terminal configuration to a working Git for Windows install."
+        )
 
     raise RuntimeError(
         "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
@@ -894,7 +934,7 @@ def _git_bash_aslr_help(bash: str, details: str = "") -> str:
     )
 
 
-def _bash_starts(bash: str) -> bool:
+def _bash_starts(bash: str, *, timeout: float = 15) -> bool:
     """True if *bash* can launch external MSYS programs.
 
     Uses ``--noprofile --norc`` so a broken login post-install
@@ -908,16 +948,17 @@ def _bash_starts(bash: str) -> bool:
         return cached
 
     try:
-        result = subprocess.run(
+        result = bounded_process_probe(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=15,
-            creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
+            timeout=timeout,
         )
-        ok = result.returncode == 0
+        ok = result is not None and result.returncode == 0
         if not ok:
-            combined = f"{result.stdout or ''}{result.stderr or ''}"
+            combined = (
+                f"{result.stdout or ''}{result.stderr or ''}"
+                if result is not None
+                else "bash capability probe timed out or failed to start"
+            )
             _bash_probe_details_cache[bash] = combined.strip()[:2000]
             logger.debug("bash probe failed for %s: %s", bash, combined.strip()[:200])
     except Exception as exc:
@@ -1424,7 +1465,11 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
-        self.init_session()
+        self._startup_deadline = time.monotonic() + max(0.01, timeout)
+        try:
+            self.init_session()
+        finally:
+            self._startup_deadline = None
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
@@ -1486,7 +1531,7 @@ class LocalEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
-        bash = _find_bash()
+        bash = _find_bash(deadline=getattr(self, "_startup_deadline", None))
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile

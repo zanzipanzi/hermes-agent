@@ -588,10 +588,31 @@ export function usePromptActions({
       setBusy(false)
     }
 
-    setAwaitingResponse(false)
-    setTurnStartedAt(null)
+    const settleStoppedTurn = (runtimeSessionId: string) => {
+      setAwaitingResponse(false)
+      setTurnStartedAt(null)
+      updateSessionState(runtimeSessionId, state => {
+        const streamId = state.streamId
+        const messages = finalizeInterruptedMessages(state.messages, streamId)
+
+        return {
+          ...state,
+          messages,
+          busy: false,
+          awaitingResponse: false,
+          streamId: null,
+          pendingBranchGroup: null,
+          needsInput: false,
+          interrupted: true,
+          turnStartedAt: null
+        }
+      })
+      releaseBusy()
+    }
 
     if (!sessionId) {
+      setAwaitingResponse(false)
+      setTurnStartedAt(null)
       releaseBusy()
       setMessages(finalizeInterruptedMessages($messages.get()))
 
@@ -599,19 +620,10 @@ export function usePromptActions({
     }
 
     updateSessionState(sessionId, state => {
-      const streamId = state.streamId
-      const messages = finalizeInterruptedMessages(state.messages, streamId)
-
       return {
         ...state,
-        messages,
-        busy: false,
-        awaitingResponse: false,
-        streamId: null,
-        pendingBranchGroup: null,
         needsInput: false,
-        interrupted: true,
-        turnStartedAt: null
+        interrupted: true
       }
     })
 
@@ -627,8 +639,11 @@ export function usePromptActions({
     clearClarifyRequest(undefined, sessionId)
 
     try {
-      await requestGateway('session.interrupt', { session_id: sessionId })
-      releaseBusy()
+      const interrupted = await requestGateway<{ quiescent?: boolean }>(
+        'session.interrupt',
+        { session_id: sessionId }
+      )
+      if (interrupted?.quiescent) settleStoppedTurn(sessionId)
     } catch (err) {
       let stopError = err
 
@@ -647,8 +662,11 @@ export function usePromptActions({
 
           if (recoveredId) {
             activeSessionIdRef.current = recoveredId
-            await requestGateway('session.interrupt', { session_id: recoveredId })
-            releaseBusy()
+            const interrupted = await requestGateway<{ quiescent?: boolean }>(
+              'session.interrupt',
+              { session_id: recoveredId }
+            )
+            if (interrupted?.quiescent) settleStoppedTurn(recoveredId)
 
             return
           }
@@ -657,7 +675,6 @@ export function usePromptActions({
         }
       }
 
-      releaseBusy()
       notifyError(stopError, copy.stopFailed)
     }
   }, [activeSessionIdRef, busyRef, copy.stopFailed, requestGateway, selectedStoredSessionIdRef, updateSessionState])

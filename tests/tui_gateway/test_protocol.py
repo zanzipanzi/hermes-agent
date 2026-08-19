@@ -162,6 +162,7 @@ def test_session_interrupt_uses_explicit_stop_compatibility(server, monkeypatch,
     )
 
     assert response["result"]["status"] == "interrupted"
+    assert response["result"]["quiescent"] is True
     assert calls == ["hard" if kind == "hard-only" else "legacy"]
 
 

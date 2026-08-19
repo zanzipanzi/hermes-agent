@@ -2968,7 +2968,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
   it('clears the active and cached turn clocks when stopping a turn', async () => {
     const states: Record<string, unknown>[] = []
-    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGateway = vi.fn(async () => ({ quiescent: true }) as never)
     $turnStartedAt.set(1_700_000_000_000)
 
     let handle: HarnessHandle | null = null
@@ -2990,6 +2990,28 @@ describe('usePromptActions sleep/wake session recovery', () => {
       interrupted: true,
       turnStartedAt: null
     })
+  })
+
+  it('keeps the turn active until the backend reports quiescence', async () => {
+    const states: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async () => ({ quiescent: false }) as never)
+    $turnStartedAt.set(1_700_000_000_000)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.cancelRun()
+
+    expect($turnStartedAt.get()).toBe(1_700_000_000_000)
+    expect(states.at(-1)).toMatchObject({ interrupted: true })
+    expect(states.at(-1)?.turnStartedAt).not.toBeNull()
   })
 
   it('surfaces the original error (no resume) when the failure is not "session not found"', async () => {

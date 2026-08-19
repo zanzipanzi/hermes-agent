@@ -42,6 +42,7 @@ __all__ = [
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "bounded_process_probe",
     "bounded_git_probe",
     "noninteractive_git_env",
 ]
@@ -373,7 +374,23 @@ def _kill_git_process_tree(proc: "subprocess.Popen") -> None:
     re-enter the deadlock class it fixes: it captures no pipes (DEVNULL), so its
     own timeout cleanup has no reader threads to join.
     """
-    if not IS_WINDOWS:
+    if IS_WINDOWS:
+        # Walk the tree while the root still exists. Killing the root first
+        # destroys the parent-child relation taskkill relies on and can leave
+        # descendants alive with inherited pipe handles.
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+                creationflags=windows_hide_flags(),
+            )
+        except Exception:
+            pass
+    else:
         # Group-kill first: verify the child actually leads its own process
         # group before signalling it, so we never blast a shared group.
         try:
@@ -388,19 +405,46 @@ def _kill_git_process_tree(proc: "subprocess.Popen") -> None:
         proc.kill()
     except OSError:
         pass
-    if IS_WINDOWS:
+
+
+def bounded_process_probe(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+) -> "subprocess.CompletedProcess[str] | None":
+    """Run a captured probe without allowing descendants to defeat its timeout."""
+    popen_kwargs: dict = (
+        {"creationflags": windows_hide_flags()}
+        if IS_WINDOWS
+        else {"process_group": 0}
+    )
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **popen_kwargs,
+        )
+    except Exception:
+        return None
+
+    try:
+        stdout, stderr = proc.communicate(timeout=max(0.01, timeout))
+    except Exception:
+        _kill_git_process_tree(proc)
         try:
-            subprocess.run(
-                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                timeout=2,
-                check=False,
-                creationflags=windows_hide_flags(),
-            )
+            proc.communicate(timeout=1)
         except Exception:
             pass
+        return None
+
+    return subprocess.CompletedProcess(
+        list(argv), proc.returncode, stdout=stdout, stderr=stderr
+    )
 
 
 def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
@@ -435,30 +479,7 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
     openai/codex#36793). ``process_group`` only changes which group the child
     belongs to; it does not detach the terminal or alter the fast path.
     """
-    _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
-    try:
-        proc = subprocess.Popen(
-            list(argv),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **_popen_kwargs,
-        )
-    except Exception:
+    result = bounded_process_probe(argv, timeout=timeout)
+    if result is None or result.returncode != 0:
         return ""
-    try:
-        stdout, _ = proc.communicate(timeout=timeout)
-    except Exception:
-        # Timeout OR any other communicate() failure (torn-down pipe, decode
-        # error): terminate the child + descendants and drain bounded. Leaving
-        # it running would leak the same suspended-descendant class this guards.
-        _kill_git_process_tree(proc)
-        try:
-            proc.communicate(timeout=1)
-        except Exception:
-            pass
-        return ""
-    return stdout.strip() if proc.returncode == 0 else ""
+    return (result.stdout or "").strip()

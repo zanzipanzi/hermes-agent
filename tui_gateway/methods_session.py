@@ -2923,7 +2923,16 @@ def _(rid, params: dict) -> dict:
             resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
         except Exception:
             pass
-        return _ok(rid, {"status": "interrupted", "turn_isolation": True})
+        with session["history_lock"]:
+            quiescent = not bool(session.get("running"))
+        return _ok(
+            rid,
+            {
+                "status": "interrupted",
+                "turn_isolation": True,
+                "quiescent": quiescent,
+            },
+        )
     session, err = _sess(params, rid)
     if err:
         return err
@@ -2967,7 +2976,9 @@ def _(rid, params: dict) -> dict:
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
     except Exception:
         pass
-    return _ok(rid, {"status": "interrupted"})
+    with session["history_lock"]:
+        quiescent = not bool(session.get("running"))
+    return _ok(rid, {"status": "interrupted", "quiescent": quiescent})
 
 
 @method("delegation.status")

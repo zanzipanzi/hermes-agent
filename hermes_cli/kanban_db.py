@@ -237,6 +237,7 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 # stops the duplication; once no duplicate is spawned the pressure eases, the
 # signal lands, and the following tick reclaims cleanly.
 RECLAIM_DEFER_GRACE_SECONDS = 120
+DEFAULT_WORKER_MAX_RUNTIME_SECONDS = 30 * 60
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -4299,6 +4300,11 @@ def claim_task(
         )
         if cur.rowcount != 1:
             return None
+        conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = "
+            "COALESCE(max_runtime_seconds, ?) WHERE id = ?",
+            (DEFAULT_WORKER_MAX_RUNTIME_SECONDS, task_id),
+        )
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
@@ -4383,6 +4389,11 @@ def claim_review_task(
         )
         if cur.rowcount != 1:
             return None
+        conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = "
+            "COALESCE(max_runtime_seconds, ?) WHERE id = ?",
+            (DEFAULT_WORKER_MAX_RUNTIME_SECONDS, task_id),
+        )
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key "
             "FROM tasks WHERE id = ?",
@@ -4628,9 +4639,19 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_worker_alive",
+        )
+        return False
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
@@ -7042,6 +7063,24 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    if _IS_WINDOWS and signal_fn is None:
+        info["termination_attempted"] = True
+        try:
+            result = subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(int(pid))],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return info
+        info["sigkill"] = result.returncode == 0
+        info["terminated"] = not _pid_alive(pid)
+        return info
+
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
@@ -7195,17 +7234,14 @@ def enforce_max_runtime(
 ) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
-    Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
-    ``timed_out`` event and drops the task back to ``ready`` so the next
-    dispatcher tick re-spawns it — unless the spawn-failure circuit
-    breaker has already given up, in which case the task stays blocked
-    where ``_record_spawn_failure`` parked it.
+    Sends SIGTERM, waits a short grace window, then SIGKILL (or terminates
+    the full process tree on Windows). Emits a ``timed_out`` event and blocks
+    the task for operator review rather than automatically re-spawning it.
 
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7233,35 +7269,26 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid,
+            row["claim_lock"],
+            signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        killed = bool(termination.get("sigkill"))
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                row["claim_lock"],
+                now,
+                termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "

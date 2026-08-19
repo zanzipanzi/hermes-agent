@@ -7590,7 +7590,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """
     with session["history_lock"]:
         queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
+        if (
+            not queued
+            or session.get("running")
+            or session.get("_turn_cancel_requested")
+        ):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         queued_prompts = session.get("queued_prompts") or []
@@ -9312,7 +9316,9 @@ def _notification_poller_loop(
             if _pending:
                 _batch: list = []
                 with session["history_lock"]:
-                    if not session.get("running"):
+                    if not session.get("running") and not session.get(
+                        "_turn_cancel_requested"
+                    ):
                         session["running"] = True
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
@@ -9413,7 +9419,7 @@ def _notification_poller_loop(
 
         _requeued = False
         with session["history_lock"]:
-            if session.get("running"):
+            if session.get("running") or session.get("_turn_cancel_requested"):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
             else:
@@ -9506,7 +9512,7 @@ def _notification_poller_loop(
             _emitted.add(_dedup_key)
 
         with session["history_lock"]:
-            if session.get("running"):
+            if session.get("running") or session.get("_turn_cancel_requested"):
                 process_registry.completion_queue.put(evt)
                 break
             session["running"] = True
@@ -10113,6 +10119,7 @@ def _run_prompt_submit(
                 status = (
                     "interrupted"
                     if result.get("interrupted")
+                    or session.get("_turn_cancel_requested")
                     else "error" if result.get("error") else "complete"
                 )
                 # When the backend produced no visible response AND reported a
@@ -10423,6 +10430,10 @@ def _run_prompt_submit(
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
+        with session["history_lock"]:
+            if session.get("_turn_cancel_requested"):
+                return
+
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
@@ -10447,7 +10458,7 @@ def _run_prompt_submit(
         # we check that guard before re-firing.
         if goal_followup:
             with session["history_lock"]:
-                if session.get("running"):
+                if session.get("running") or session.get("_turn_cancel_requested"):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
@@ -10487,7 +10498,7 @@ def _run_prompt_submit(
             )
             for index, (_evt, synth) in enumerate(drained):
                 with session["history_lock"]:
-                    if session.get("running"):
+                    if session.get("running") or session.get("_turn_cancel_requested"):
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break

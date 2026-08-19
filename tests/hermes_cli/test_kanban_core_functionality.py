@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -260,7 +261,7 @@ def test_read_worker_log_tail(kanban_home):
 
 def test_max_runtime_terminates_overrun_worker(kanban_home):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
-    SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
+    SIGTERM'd, emits a ``timed_out`` event, and blocks for operator review."""
     killed = []
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
@@ -299,7 +300,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             assert killed and killed[0][0] == os.getpid()
 
             task = kb.get_task(conn, tid)
-            assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
+            assert task.status == "blocked",               f"timed-out task should block, got {task.status}"
             assert task.worker_pid is None
             assert task.last_heartbeat_at is None
 
@@ -312,6 +313,47 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             conn.close()
     finally:
         _kb._pid_alive = original_alive
+
+
+def test_max_runtime_keeps_claim_when_local_worker_survives(
+    kanban_home, monkeypatch
+):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="overrun survivor",
+            assignee="worker",
+            max_runtime_seconds=1,
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 12345)
+        old_started = int(time.time()) - 60
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (old_started, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (old_started, claimed.current_run_id),
+            )
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 12345)
+
+        timed_out = kb.enforce_max_runtime(
+            conn,
+            signal_fn=lambda *_args: None,
+        )
+
+        assert timed_out == []
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.claim_lock == claimed.claim_lock
+        assert task.worker_pid == 12345
+        assert not any(e.kind == "timed_out" for e in kb.list_events(conn, task_id))
+    finally:
+        conn.close()
 
 
 
@@ -1198,8 +1240,8 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
 # Recovery helpers (reclaim + reassign)
 # ---------------------------------------------------------------------------
 
-def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
-    """Manual reclaim releases the claim, resets status, and emits a
+def test_reclaim_task_blocks_after_terminating_worker(kanban_home, monkeypatch):
+    """Manual reclaim releases the claim, blocks the task, and emits a
     ``reclaimed`` event even when claim_expires has not passed."""
     import signal
     import time
@@ -1244,7 +1286,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",
             (t,),
         ).fetchone()
-        assert row["status"] == "ready"
+        assert row["status"] == "blocked"
         assert row["claim_lock"] is None
         assert row["worker_pid"] is None
 
@@ -1262,6 +1304,118 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert reclaim_evs[0].get("termination_attempted") is True
         assert reclaim_evs[0].get("terminated") is True
         assert killed == [signal.SIGTERM]
+    finally:
+        conn.close()
+
+
+def test_reclaim_task_keeps_claim_when_local_worker_survives(
+    kanban_home, monkeypatch
+):
+    import secrets
+    import time
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="still alive", assignee="worker")
+        lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
+        future = int(time.time()) + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "worker_pid=? WHERE id=?",
+            (lock, future, 12345, task_id),
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            _kb,
+            "_terminate_reclaimed_worker",
+            lambda *args, **kwargs: {
+                "prev_pid": 12345,
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": False,
+                "sigkill": True,
+            },
+        )
+
+        assert kb.reclaim_task(conn, task_id, reason="survivor") is False
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.claim_lock == lock
+        assert task.worker_pid == 12345
+        assert not any(e.kind == "reclaimed" for e in kb.list_events(conn, task_id))
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows taskkill")
+def test_windows_reclaim_terminates_worker_descendant_tree(tmp_path):
+    from gateway.status import _pid_exists
+
+    child_pid_file = tmp_path / "child.pid"
+    child_code = "import time; time.sleep(60)"
+    parent_code = (
+        "import pathlib, subprocess, sys, time; "
+        f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid)); "
+        "time.sleep(60)"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert child_pid_file.exists()
+        child_pid = int(child_pid_file.read_text())
+
+        host = kb._claimer_id().split(":", 1)[0]
+        termination = kb._terminate_reclaimed_worker(
+            parent.pid,
+            f"{host}:tree-test",
+        )
+
+        assert termination["terminated"] is True
+        deadline = time.monotonic() + 3
+        while (
+            (_pid_exists(parent.pid) or _pid_exists(child_pid))
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert not _pid_exists(parent.pid)
+        assert not _pid_exists(child_pid)
+    finally:
+        for pid in (parent.pid, child_pid):
+            if pid and _pid_exists(pid):
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+
+
+def test_claim_materializes_default_worker_runtime(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="bounded by default", assignee="worker")
+
+        claimed = kb.claim_task(conn, task_id)
+
+        assert claimed is not None
+        assert claimed.max_runtime_seconds == kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+        run = conn.execute(
+            "SELECT max_runtime_seconds FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+        assert run["max_runtime_seconds"] == kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
     finally:
         conn.close()
 
