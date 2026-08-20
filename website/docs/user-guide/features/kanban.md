@@ -751,18 +751,25 @@ All commands are also available as a slash command in the interactive CLI and in
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
-### Concurrency, scheduling, and child promotion config
+### Worker bounds, scheduling, and child promotion config
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
-| `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.max_spawn` | `3` | Board-wide live-worker cap enforced by the dispatcher. Existing `running` tasks count against it, so repeated ticks cannot grow concurrency past this value. |
+| `kanban.max_in_progress` | `3` | Board-wide cap on simultaneously running tasks. The dispatcher stops spawning when the board reaches this bound. |
+| `kanban.max_in_progress_per_profile` | `2` | Per-profile concurrency cap. Applies alongside the board-wide cap; both must allow a spawn. |
+| `kanban.worker_max_runtime_seconds` | `1800` | Default wall-clock limit for every worker attempt. A task's explicit `max_runtime_seconds` still wins. The dispatcher persists the resolved limit before spawn and terminates the worker process tree when it expires. |
+| `kanban.worker_max_api_turns` | `32` | Hard cumulative model-call budget for one worker run. Unlike an interactive session, a worker gets no extra summary call after exhausting it. |
+| `kanban.worker_max_total_tokens` | `250000` | Hard cumulative token gate. The worker stops before starting another model cycle after reaching the threshold. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
-  max_in_progress: 2
+  max_in_progress: 3
+  worker_max_runtime_seconds: 1800
+  worker_max_api_turns: 32
+  worker_max_total_tokens: 250000
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
@@ -1019,6 +1026,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 |---|---|---|
 | `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
+| `worker_cycle_started` | `{cycle, session_id, total_tokens, max_api_turns, max_total_tokens}` | Durable pre-call receipt. The dispatcher-owned worker writes this only while it still owns the exact task/run/claim tuple; the count enforces the cumulative API-turn budget even across goal-loop turns. |
+| `worker_cycle_completed` | `{cycle, session_id, total_tokens, input_tokens, output_tokens}` | Durable post-call receipt written before any returned tool calls execute. If ownership was reclaimed while the call was in flight, no completion receipt is written and the worker stops before processing the response. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |

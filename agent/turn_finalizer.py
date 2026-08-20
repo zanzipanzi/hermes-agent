@@ -109,6 +109,9 @@ def finalize_turn(
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False
+    kanban_worker_budget_exhausted = bool(
+        os.environ.get("HERMES_KANBAN_TASK") and budget_fallback_eligible
+    )
     if continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
@@ -124,6 +127,18 @@ def finalize_turn(
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
+    elif final_response is None and kanban_worker_budget_exhausted:
+        # Worker API-turn caps are strict. The ordinary fallback spends one
+        # extra toolless model call after max_iterations, which is useful for
+        # interactive sessions but violates a dispatcher's hard per-run budget.
+        _turn_exit_reason = (
+            f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        )
+        final_response = (
+            "Kanban worker exhausted its API-turn budget before completing "
+            "the task."
+        )
+        iteration_limit_fallback = True
     elif final_response is None and budget_fallback_eligible:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
@@ -173,6 +188,11 @@ def finalize_turn(
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
                         },
+                        expected_run_id=(
+                            int(os.environ["HERMES_KANBAN_RUN_ID"])
+                            if os.environ.get("HERMES_KANBAN_RUN_ID", "").isdigit()
+                            else None
+                        ),
                     )
                     logger.info(
                         "recorded budget-exhausted failure for task %s (%d/%d)",

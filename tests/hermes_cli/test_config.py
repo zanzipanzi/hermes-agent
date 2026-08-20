@@ -36,7 +36,9 @@ class TestGetHermesHome:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HOME", None)
             home = get_hermes_home()
-            assert home == Path.home() / ".hermes"
+            from hermes_constants import _get_platform_default_hermes_home
+
+            assert home == _get_platform_default_hermes_home()
 
 
 class TestEnsureHermesHome:

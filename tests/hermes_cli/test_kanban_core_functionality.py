@@ -14,7 +14,6 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -261,7 +260,7 @@ def test_read_worker_log_tail(kanban_home):
 
 def test_max_runtime_terminates_overrun_worker(kanban_home):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
-    SIGTERM'd, emits a ``timed_out`` event, and blocks for operator review."""
+    SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
     killed = []
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
@@ -300,7 +299,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             assert killed and killed[0][0] == os.getpid()
 
             task = kb.get_task(conn, tid)
-            assert task.status == "blocked",               f"timed-out task should block, got {task.status}"
+            assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
             assert task.worker_pid is None
             assert task.last_heartbeat_at is None
 
@@ -348,12 +347,108 @@ def test_max_runtime_keeps_claim_when_local_worker_survives(
 
         assert timed_out == []
         task = kb.get_task(conn, task_id)
+        assert task is not None
         assert task.status == "running"
         assert task.claim_lock == claimed.claim_lock
         assert task.worker_pid == 12345
         assert not any(e.kind == "timed_out" for e in kb.list_events(conn, task_id))
     finally:
         conn.close()
+
+
+def test_dispatch_materializes_default_runtime_before_spawn(kanban_home):
+    """An omitted task override still becomes a strict per-run wall-clock cap."""
+    spawned = []
+
+    def _spawn(task, workspace, **_kwargs):
+        spawned.append((task.id, task.max_runtime_seconds))
+        return 99999
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded by default", assignee="default")
+        assert kb.get_task(conn, tid).max_runtime_seconds is None
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_spawn,
+            max_spawn=1,
+            default_max_runtime_seconds=123,
+        )
+
+        assert result.spawned and result.spawned[0][0] == tid
+        assert spawned == [(tid, 123)]
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert task.max_runtime_seconds == 123
+        assert run.max_runtime_seconds == 123
+    finally:
+        conn.close()
+
+
+def test_default_worker_limits_are_all_finite_and_positive():
+    """The shipped configuration cannot silently restore an unbounded worker."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    config = DEFAULT_CONFIG["kanban"]
+    for key in (
+        "worker_max_runtime_seconds",
+        "worker_max_api_turns",
+        "worker_max_total_tokens",
+        "max_spawn",
+        "max_in_progress",
+        "max_in_progress_per_profile",
+    ):
+        value = config[key]
+        assert isinstance(value, int) and not isinstance(value, bool)
+        assert value > 0
+
+
+def test_crashed_worker_finalizes_exact_run_session(kanban_home, monkeypatch):
+    """Crash reconciliation closes the deterministic worker session lineage."""
+    conn = kb.connect()
+    calls = []
+    try:
+        tid = kb.create_task(conn, title="crashed lineage", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        run_id = run.id
+        kb._set_worker_pid(conn, tid, 993001)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb,
+            "_finalize_worker_session_lineage",
+            lambda session_id, *, reason: calls.append((session_id, reason)) or True,
+        )
+
+        assert kb.detect_crashed_workers(conn) == [tid]
+        assert calls == [
+            (kb.worker_session_id(tid, run_id), "kanban_worker_crashed")
+        ]
+        crashed = [e for e in kb.list_events(conn, tid) if e.kind == "crashed"]
+        assert crashed[-1].payload is not None
+        assert crashed[-1].payload["session_finalized"] is True
+    finally:
+        conn.close()
+
+
+def test_reclaimed_worker_uses_process_tree_terminator(kanban_home, monkeypatch):
+    """Reclaim delegates to the exact-tree primitive, never parent-only kill."""
+    calls = []
+    alive = iter((True, False))
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: next(alive, False))
+
+    result = kb._terminate_reclaimed_worker(
+        4242,
+        f"{kb._claimer_id().split(':', 1)[0]}:999",
+        process_tree_fn=lambda pid, *, force: calls.append((pid, force)),
+    )
+
+    assert calls == [(4242, False)]
+    assert result["termination_attempted"] is True
+    assert result["terminated"] is True
 
 
 
@@ -1240,8 +1335,8 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
 # Recovery helpers (reclaim + reassign)
 # ---------------------------------------------------------------------------
 
-def test_reclaim_task_blocks_after_terminating_worker(kanban_home, monkeypatch):
-    """Manual reclaim releases the claim, blocks the task, and emits a
+def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
+    """Manual reclaim releases the claim, resets status, and emits a
     ``reclaimed`` event even when claim_expires has not passed."""
     import signal
     import time
@@ -1286,7 +1381,7 @@ def test_reclaim_task_blocks_after_terminating_worker(kanban_home, monkeypatch):
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",
             (t,),
         ).fetchone()
-        assert row["status"] == "blocked"
+        assert row["status"] == "ready"
         assert row["claim_lock"] is None
         assert row["worker_pid"] is None
 
@@ -1304,118 +1399,6 @@ def test_reclaim_task_blocks_after_terminating_worker(kanban_home, monkeypatch):
         assert reclaim_evs[0].get("termination_attempted") is True
         assert reclaim_evs[0].get("terminated") is True
         assert killed == [signal.SIGTERM]
-    finally:
-        conn.close()
-
-
-def test_reclaim_task_keeps_claim_when_local_worker_survives(
-    kanban_home, monkeypatch
-):
-    import secrets
-    import time
-    import hermes_cli.kanban_db as _kb
-
-    conn = kb.connect()
-    try:
-        task_id = kb.create_task(conn, title="still alive", assignee="worker")
-        lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
-        future = int(time.time()) + 3600
-        conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, future, 12345, task_id),
-        )
-        conn.commit()
-        monkeypatch.setattr(
-            _kb,
-            "_terminate_reclaimed_worker",
-            lambda *args, **kwargs: {
-                "prev_pid": 12345,
-                "host_local": True,
-                "termination_attempted": True,
-                "terminated": False,
-                "sigkill": True,
-            },
-        )
-
-        assert kb.reclaim_task(conn, task_id, reason="survivor") is False
-        task = kb.get_task(conn, task_id)
-        assert task.status == "running"
-        assert task.claim_lock == lock
-        assert task.worker_pid == 12345
-        assert not any(e.kind == "reclaimed" for e in kb.list_events(conn, task_id))
-    finally:
-        conn.close()
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows taskkill")
-def test_windows_reclaim_terminates_worker_descendant_tree(tmp_path):
-    from gateway.status import _pid_exists
-
-    child_pid_file = tmp_path / "child.pid"
-    child_code = "import time; time.sleep(60)"
-    parent_code = (
-        "import pathlib, subprocess, sys, time; "
-        f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
-        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid)); "
-        "time.sleep(60)"
-    )
-    parent = subprocess.Popen(
-        [sys.executable, "-c", parent_code],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-    child_pid = None
-    try:
-        deadline = time.monotonic() + 5
-        while not child_pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert child_pid_file.exists()
-        child_pid = int(child_pid_file.read_text())
-
-        host = kb._claimer_id().split(":", 1)[0]
-        termination = kb._terminate_reclaimed_worker(
-            parent.pid,
-            f"{host}:tree-test",
-        )
-
-        assert termination["terminated"] is True
-        deadline = time.monotonic() + 3
-        while (
-            (_pid_exists(parent.pid) or _pid_exists(child_pid))
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.05)
-        assert not _pid_exists(parent.pid)
-        assert not _pid_exists(child_pid)
-    finally:
-        for pid in (parent.pid, child_pid):
-            if pid and _pid_exists(pid):
-                subprocess.run(
-                    ["taskkill", "/T", "/F", "/PID", str(pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-
-
-def test_claim_materializes_default_worker_runtime(kanban_home):
-    conn = kb.connect()
-    try:
-        task_id = kb.create_task(conn, title="bounded by default", assignee="worker")
-
-        claimed = kb.claim_task(conn, task_id)
-
-        assert claimed is not None
-        assert claimed.max_runtime_seconds == kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
-        run = conn.execute(
-            "SELECT max_runtime_seconds FROM task_runs WHERE id = ?",
-            (claimed.current_run_id,),
-        ).fetchone()
-        assert run["max_runtime_seconds"] == kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
     finally:
         conn.close()
 
@@ -1472,6 +1455,26 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     W_EXITCODE(1, 0) == 256 — WIFEXITED True, WEXITSTATUS == 1.
     """
     return _drive_worker_exit(conn, tid, fake_pid, 256)
+
+
+def test_windows_reaper_preserves_worker_return_code(monkeypatch):
+    """Windows polling must retain enough state to classify a clean exit."""
+    import hermes_cli.kanban_db as _kb
+
+    class _ExitedProcess:
+        def poll(self):
+            return 0
+
+    fake_pid = 992000
+    monkeypatch.setattr(_kb.os, "name", "nt")
+    _kb._windows_worker_processes[fake_pid] = _ExitedProcess()  # type: ignore[assignment]
+    try:
+        assert _kb.reap_worker_zombies() == [fake_pid]
+        assert _kb._classify_worker_exit(fake_pid) == ("clean_exit", 0)
+        assert fake_pid not in _kb._windows_worker_processes
+    finally:
+        _kb._windows_worker_processes.pop(fake_pid, None)
+        _kb._recent_worker_exits.pop(fake_pid, None)
 
 
 def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):

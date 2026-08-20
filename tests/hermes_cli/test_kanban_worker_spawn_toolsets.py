@@ -131,6 +131,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
+    assert args.max_turns == kb.DEFAULT_WORKER_MAX_API_TURNS
     assert args.query == "work kanban task t_spawn_tools"
 
 

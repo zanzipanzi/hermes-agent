@@ -2466,11 +2466,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        default_max_runtime_seconds = _coerce_positive_int(
+            _kanban_cfg.get("worker_max_runtime_seconds")
+        ) or kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        default_max_runtime_seconds = kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2480,6 +2484,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -3168,7 +3173,21 @@ def run_slash(rest: str) -> str:
     import io
     import contextlib
 
-    tokens = shlex.split(rest) if rest and rest.strip() else []
+    if rest and rest.strip():
+        # POSIX shlex treats every backslash as an escape character and turns
+        # ``C:\\Users\\me\\file.png`` into ``C:Usersmefile.png``. Native
+        # Windows slash commands need non-POSIX tokenization; strip one pair of
+        # surrounding quotes afterwards because shlex(posix=False) retains it.
+        tokens = shlex.split(rest, posix=os.name != "nt")
+        if os.name == "nt":
+            tokens = [
+                token[1:-1]
+                if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
+                else token
+                for token in tokens
+            ]
+    else:
+        tokens = []
 
     # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
     # show the curated short-help block instead of dumping argparse's full

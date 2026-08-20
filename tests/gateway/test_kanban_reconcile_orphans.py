@@ -61,6 +61,29 @@ def _orphan_running(conn, tid, *, claim_lock=None, claim_expires=None,
 
 
 class TestReconcileOrphanedRunning:
+    def test_orphan_reconcile_finalizes_exact_run_session(self, conn, monkeypatch):
+        tid = kb.create_task(conn, title="orphan lineage", assignee="w")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        run_id = run.id
+        _orphan_running(conn, tid)
+        calls = []
+        monkeypatch.setattr(
+            kb,
+            "_finalize_worker_session_lineage",
+            lambda session_id, *, reason: calls.append((session_id, reason)) or True,
+        )
+
+        assert kb.reconcile_orphaned_running(conn) == [tid]
+        assert calls == [
+            (kb.worker_session_id(tid, run_id), "kanban_orphan_reconciled")
+        ]
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "reconciled"][-1]
+        assert event.payload is not None
+        assert event.payload["session_finalized"] is True
+
     def test_null_claim_lock_orphan_requeued(self, conn):
         """running + claim_lock NULL → requeued to ready with a note."""
         tid = kb.create_task(conn, title="zombie", assignee="w")

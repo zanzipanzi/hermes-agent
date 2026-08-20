@@ -1160,6 +1160,21 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        raw_worker_runtime = kanban_cfg.get(
+            "worker_max_runtime_seconds",
+            _kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
+        )
+        try:
+            default_max_runtime_seconds = max(1, int(raw_worker_runtime))
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.worker_max_runtime_seconds=%r; "
+                "using %d",
+                raw_worker_runtime,
+                _kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
+            )
+            default_max_runtime_seconds = _kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1253,6 +1268,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    default_max_runtime_seconds=default_max_runtime_seconds,
                     reconcile_orphans=reconcile_orphans,
                 )
             except sqlite3.DatabaseError as exc:
