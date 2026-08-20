@@ -244,7 +244,6 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 # stops the duplication; once no duplicate is spawned the pressure eases, the
 # signal lands, and the following tick reclaims cleanly.
 RECLAIM_DEFER_GRACE_SECONDS = 120
-DEFAULT_WORKER_MAX_RUNTIME_SECONDS = 30 * 60
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -4237,6 +4236,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    default_max_runtime_seconds: int = DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4310,7 +4310,13 @@ def claim_task(
         conn.execute(
             "UPDATE tasks SET max_runtime_seconds = "
             "COALESCE(max_runtime_seconds, ?) WHERE id = ?",
-            (DEFAULT_WORKER_MAX_RUNTIME_SECONDS, task_id),
+            (
+                _positive_int(
+                    default_max_runtime_seconds,
+                    DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
+                ),
+                task_id,
+            ),
         )
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
@@ -4364,6 +4370,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    default_max_runtime_seconds: int = DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4399,7 +4406,13 @@ def claim_review_task(
         conn.execute(
             "UPDATE tasks SET max_runtime_seconds = "
             "COALESCE(max_runtime_seconds, ?) WHERE id = ?",
-            (DEFAULT_WORKER_MAX_RUNTIME_SECONDS, task_id),
+            (
+                _positive_int(
+                    default_max_runtime_seconds,
+                    DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
+                ),
+                task_id,
+            ),
         )
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key "
@@ -4669,7 +4682,7 @@ def reclaim_task(
         )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
@@ -8790,7 +8803,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            default_max_runtime_seconds=default_max_runtime_seconds,
+        )
         if claimed is None:
             continue
         _materialize_worker_runtime_limit(
@@ -8887,7 +8905,12 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            default_max_runtime_seconds=default_max_runtime_seconds,
+        )
         if claimed is None:
             continue
         _materialize_worker_runtime_limit(

@@ -25,7 +25,9 @@ class TestFindShellPrefersUserShell:
         fake_zsh = tmp_path / "zsh"
         fake_zsh.touch()
         fake_zsh.chmod(0o755)
-        with patch.dict(os.environ, {"SHELL": str(fake_zsh)}):
+        with patch("tools.environments.local._IS_WINDOWS", False), patch.dict(
+            os.environ, {"SHELL": str(fake_zsh)}
+        ):
             assert _find_shell() == str(fake_zsh)
 
     def test_falls_back_when_shell_not_executable(self, tmp_path):
@@ -54,7 +56,9 @@ class TestFindShellPrefersUserShell:
             fake = tmp_path / name
             fake.touch()
             fake.chmod(0o755)
-            with patch.dict(os.environ, {"SHELL": str(fake)}):
+            with patch("tools.environments.local._IS_WINDOWS", False), patch.dict(
+                os.environ, {"SHELL": str(fake)}
+            ):
                 assert _find_shell() == str(fake), name
 
 
