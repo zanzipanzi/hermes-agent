@@ -314,6 +314,101 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
         _kb._pid_alive = original_alive
 
 
+def test_dispatch_materializes_default_runtime_before_spawn(kanban_home):
+    """An omitted task override still becomes a strict per-run wall-clock cap."""
+    spawned = []
+
+    def _spawn(task, workspace, **_kwargs):
+        spawned.append((task.id, task.max_runtime_seconds))
+        return 99999
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded by default", assignee="default")
+        assert kb.get_task(conn, tid).max_runtime_seconds is None
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_spawn,
+            max_spawn=1,
+            default_max_runtime_seconds=123,
+        )
+
+        assert result.spawned and result.spawned[0][0] == tid
+        assert spawned == [(tid, 123)]
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert task.max_runtime_seconds == 123
+        assert run.max_runtime_seconds == 123
+    finally:
+        conn.close()
+
+
+def test_default_worker_limits_are_all_finite_and_positive():
+    """The shipped configuration cannot silently restore an unbounded worker."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    config = DEFAULT_CONFIG["kanban"]
+    for key in (
+        "worker_max_runtime_seconds",
+        "worker_max_api_turns",
+        "worker_max_total_tokens",
+        "max_spawn",
+        "max_in_progress",
+        "max_in_progress_per_profile",
+    ):
+        value = config[key]
+        assert isinstance(value, int) and not isinstance(value, bool)
+        assert value > 0
+
+
+def test_crashed_worker_finalizes_exact_run_session(kanban_home, monkeypatch):
+    """Crash reconciliation closes the deterministic worker session lineage."""
+    conn = kb.connect()
+    calls = []
+    try:
+        tid = kb.create_task(conn, title="crashed lineage", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        run_id = run.id
+        kb._set_worker_pid(conn, tid, 993001)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb,
+            "_finalize_worker_session_lineage",
+            lambda session_id, *, reason: calls.append((session_id, reason)) or True,
+        )
+
+        assert kb.detect_crashed_workers(conn) == [tid]
+        assert calls == [
+            (kb.worker_session_id(tid, run_id), "kanban_worker_crashed")
+        ]
+        crashed = [e for e in kb.list_events(conn, tid) if e.kind == "crashed"]
+        assert crashed[-1].payload is not None
+        assert crashed[-1].payload["session_finalized"] is True
+    finally:
+        conn.close()
+
+
+def test_reclaimed_worker_uses_process_tree_terminator(kanban_home, monkeypatch):
+    """Reclaim delegates to the exact-tree primitive, never parent-only kill."""
+    calls = []
+    alive = iter((True, False))
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: next(alive, False))
+
+    result = kb._terminate_reclaimed_worker(
+        4242,
+        f"{kb._claimer_id().split(':', 1)[0]}:999",
+        process_tree_fn=lambda pid, *, force: calls.append((pid, force)),
+    )
+
+    assert calls == [(4242, False)]
+    assert result["termination_attempted"] is True
+    assert result["terminated"] is True
+
+
 
 
 
@@ -1318,6 +1413,26 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     W_EXITCODE(1, 0) == 256 — WIFEXITED True, WEXITSTATUS == 1.
     """
     return _drive_worker_exit(conn, tid, fake_pid, 256)
+
+
+def test_windows_reaper_preserves_worker_return_code(monkeypatch):
+    """Windows polling must retain enough state to classify a clean exit."""
+    import hermes_cli.kanban_db as _kb
+
+    class _ExitedProcess:
+        def poll(self):
+            return 0
+
+    fake_pid = 992000
+    monkeypatch.setattr(_kb.os, "name", "nt")
+    _kb._windows_worker_processes[fake_pid] = _ExitedProcess()  # type: ignore[assignment]
+    try:
+        assert _kb.reap_worker_zombies() == [fake_pid]
+        assert _kb._classify_worker_exit(fake_pid) == ("clean_exit", 0)
+        assert fake_pid not in _kb._windows_worker_processes
+    finally:
+        _kb._windows_worker_processes.pop(fake_pid, None)
+        _kb._recent_worker_exits.pop(fake_pid, None)
 
 
 def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):

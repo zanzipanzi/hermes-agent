@@ -9135,15 +9135,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not prefix:
             return 0
 
-        gate = f"kanban_worker_source_retagged:{prefix}"
+        # Session cwd values can come from native Windows callers
+        # (``C:\\...``) or from Git Bash/MSYS (``C:/...``).  Compare a
+        # slash-normalized expression so the one-time legacy sweep works for
+        # both spellings without weakening POSIX path matching.
+        normalized_prefix = prefix.replace("\\", "/")
+
+        gate = f"kanban_worker_source_retagged:{normalized_prefix}"
         if self.get_meta(gate) == "1":
             return 0
 
         def _do(conn):
             cursor = conn.execute(
                 "UPDATE sessions SET source = 'kanban' "
-                "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, _escape_like(prefix) + "/%"),
+                "WHERE source = 'cli' AND ("
+                "REPLACE(cwd, char(92), '/') = ? OR "
+                "REPLACE(cwd, char(92), '/') LIKE ? ESCAPE '\\')",
+                (
+                    normalized_prefix,
+                    _escape_like(normalized_prefix) + "/%",
+                ),
             )
             # Read rowcount before set_meta reuses this cursor for its INSERT,
             # which would otherwise overwrite it with the meta write's count.

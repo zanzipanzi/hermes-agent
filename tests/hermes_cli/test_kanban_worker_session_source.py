@@ -6,6 +6,7 @@ per attempt, labeled with the worker's own prompt.
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -60,6 +61,84 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     kb._default_spawn(task, workspace)
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
+
+
+def test_worker_spawn_has_bounded_runtime_env_and_durable_launch_log(monkeypatch, tmp_path):
+    """Bounds and the log path exist before the worker can make its first call."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    from hermes_cli import kanban_db as kb
+
+    captured = {}
+
+    class _Proc:
+        pid = 4321
+
+    def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
+
+    task = kb.Task(
+        id="t_b21733fb",
+        title="ship it",
+        body=None,
+        assignee="default",
+        status="running",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=0,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock="host:123",
+        claim_expires=None,
+        tenant=None,
+        current_run_id=7,
+        max_runtime_seconds=60,
+    )
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace, exist_ok=True)
+
+    kb._default_spawn(task, workspace)
+
+    env = captured["env"]
+    config = DEFAULT_CONFIG["kanban"]
+    assert env["HERMES_KANBAN_MAX_API_TURNS"] == str(config["worker_max_api_turns"])
+    assert env["HERMES_KANBAN_MAX_TOTAL_TOKENS"] == str(config["worker_max_total_tokens"])
+    assert env["HERMES_KANBAN_WORKER_SESSION_ID"] == kb.worker_session_id(task.id, 7)
+    log_path = Path(env["HERMES_KANBAN_WORKER_LOG"])
+    assert log_path.exists()
+    assert "worker_spawned" in log_path.read_text(encoding="utf-8")
+
+
+def test_reclaim_finalizes_worker_session_and_live_compression_tip(db):
+    """A reclaimed process leaves neither its root nor compression child live."""
+    from hermes_cli import kanban_db as kb
+
+    root = kb.worker_session_id("t_b21733fb", 7)
+    child = f"{root}_child"
+    db.create_session(session_id=root, source="kanban")
+    db.end_session(root, "compression")
+    db.create_session(session_id=child, source="kanban", parent_session_id=root)
+    db.touch_session_activity(child, description="starting API call #2")
+
+    assert kb._finalize_worker_session_lineage(root, reason="kanban_reclaimed")
+
+    rows = {
+        row["id"]: row
+        for row in db._conn.execute(
+            "SELECT id, ended_at, end_reason FROM sessions WHERE id IN (?, ?)",
+            (root, child),
+        )
+    }
+    assert rows[root]["end_reason"] == "compression"
+    assert rows[child]["ended_at"] is not None
+    assert rows[child]["end_reason"] == "kanban_reclaimed"
 
 
 def test_kanban_rows_stay_out_of_the_session_list(db):

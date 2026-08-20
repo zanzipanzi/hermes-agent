@@ -2332,6 +2332,20 @@ DEFAULT_CONFIG = {
         # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Every spawned worker is bounded even when a task omits an explicit
+        # override. The dispatcher materializes this value onto the task + run
+        # before spawn so timeout enforcement never depends on a nullable row.
+        "worker_max_runtime_seconds": 1800,
+        # Cumulative limits for one worker process/run. Unlike the agent's
+        # per-turn max_iterations, these survive goal-loop continuations and
+        # count every accepted Kanban API cycle durably in task_events.
+        "worker_max_api_turns": 32,
+        "worker_max_total_tokens": 250000,
+        # Hard fan-out bounds. max_spawn is the dispatcher's board-wide live
+        # worker cap; max_in_progress is the explicit scheduling cap; the
+        # per-profile cap prevents one assignee monopolizing every slot.
+        "max_spawn": 3,
+        "max_in_progress": 3,
         # Profile assigned to the root/orchestration task after Triage
         # decomposition. When unset, falls back to the default profile (the
         # one `hermes` launches with no -p flag). This does not control the
@@ -2346,11 +2360,9 @@ DEFAULT_CONFIG = {
         # no single profile can have more than N workers running at once,
         # even if the global max_in_progress / max_spawn caps would allow
         # it. Tasks blocked this way defer to the next dispatcher tick.
-        # Unset (None) means "no per-profile cap" — backward-compatible
-        # with existing installs. Useful for fan-out workflows that would
-        # otherwise saturate one profile's local model / API quota /
-        # browser pool while leaving other profiles idle.
-        "max_in_progress_per_profile": None,
+        # Keep this below the global cap so one profile cannot saturate the
+        # worker pool while leaving other profiles idle.
+        "max_in_progress_per_profile": 2,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

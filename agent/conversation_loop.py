@@ -1558,7 +1558,26 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
-        
+
+        _kanban_worker_cycle = 0
+        _kanban_claim_lost_after_call = False
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            from agent.kanban_worker_runtime import begin_api_cycle
+
+            _kanban_decision = begin_api_cycle(
+                session_id=agent.session_id or "",
+                total_tokens=getattr(agent, "session_total_tokens", 0),
+            )
+            if not _kanban_decision.allowed:
+                failed = True
+                _turn_exit_reason = f"kanban_worker_{_kanban_decision.reason}"
+                final_response = (
+                    "Kanban worker stopped before the next model call: "
+                    f"{_kanban_decision.reason}."
+                )
+                break
+            _kanban_worker_cycle = _kanban_decision.cycle
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -3642,6 +3661,16 @@ def run_conversation(
                     outcome="success",
                 )
                 agent._touch_activity(f"API call #{api_call_count} completed")
+                if _kanban_worker_cycle:
+                    from agent.kanban_worker_runtime import complete_api_cycle
+
+                    _kanban_claim_lost_after_call = not complete_api_cycle(
+                        session_id=agent.session_id or "",
+                        cycle=_kanban_worker_cycle,
+                        total_tokens=getattr(agent, "session_total_tokens", 0),
+                        input_tokens=getattr(agent, "session_input_tokens", 0),
+                        output_tokens=getattr(agent, "session_output_tokens", 0),
+                    )
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -5782,7 +5811,16 @@ def run_conversation(
                     # iteration from the correction instead of re-firing the
                     # stale request.
                     break
-        
+
+        if _kanban_claim_lost_after_call:
+            failed = True
+            _turn_exit_reason = "kanban_worker_claim_lost_after_api_call"
+            final_response = (
+                "Kanban worker stopped because its claim was reclaimed while "
+                "the model call was in flight."
+            )
+            break
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed

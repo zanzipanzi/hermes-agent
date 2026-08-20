@@ -62,11 +62,13 @@ _IMAGE_EXTS = (
 )
 _IMAGE_EXT_PATTERN = "|".join(e.lstrip(".") for e in _IMAGE_EXTS)
 
-# Absolute / home-relative local image path. Matches the same shape gateway's
-# extract_local_files() uses: anchors to ``~/`` or ``/``, ignores matches inside
-# URLs (the ``(?<![/:\w.])`` lookbehind), and case-insensitive on the extension.
+# Absolute / home-relative local image path. Supports POSIX/home paths and
+# native Windows drive paths with either slash direction. Ignores matches
+# inside URLs and is case-insensitive on the extension.
 _LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
+    r"(?<![/:\w.])(?:(?:~/|/)(?:[\w.\-]+/)*|"
+    r"[A-Za-z]:[\\/](?:[\w.\-]+[\\/])*)"
+    r"[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
     re.IGNORECASE,
 )
 
@@ -84,9 +86,10 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
 
     Returns ``(local_paths, urls)``:
 
-      * ``local_paths`` — absolute (``/``) or home-relative (``~/``) paths
-        whose suffix is an image extension AND whose expanded form exists
-        on disk as a file. Order-preserving, deduplicated.
+      * ``local_paths`` — POSIX absolute (``/``), home-relative (``~/``), or
+        native Windows drive paths whose suffix is an image extension AND
+        whose expanded form exists on disk as a file. Order-preserving,
+        deduplicated.
       * ``urls`` — ``http(s)://…`` URLs whose path ends in an image
         extension (a ``?query`` is allowed after the extension).
         Order-preserving, deduplicated.

@@ -218,6 +218,13 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# Worker safety defaults are duplicated here intentionally: the dispatcher
+# must remain bounded even when config loading fails or a direct library caller
+# invokes ``dispatch_once`` without going through the gateway/CLI loaders.
+DEFAULT_WORKER_MAX_RUNTIME_SECONDS = 30 * 60
+DEFAULT_WORKER_MAX_API_TURNS = 32
+DEFAULT_WORKER_MAX_TOTAL_TOKENS = 250_000
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -4485,7 +4492,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "       current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -4556,6 +4564,11 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
+        if row["current_run_id"] is not None:
+            termination["session_finalized"] = _finalize_worker_session_lineage(
+                worker_session_id(row["id"], int(row["current_run_id"])),
+                reason="kanban_reclaimed",
+            )
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -4616,7 +4629,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -4628,6 +4641,21 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_worker_alive",
+        )
+        return False
+    if row["current_run_id"] is not None:
+        termination["session_finalized"] = _finalize_worker_session_lineage(
+            worker_session_id(task_id, int(row["current_run_id"])),
+            reason="kanban_reclaimed",
+        )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -6863,6 +6891,10 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+# Windows has no waitpid/WIFEXITED API.  Keep the Popen handles created by
+# this dispatcher so the next tick can poll an exact return code instead of
+# reducing every dead worker to the ambiguous ``unknown`` class.
+_windows_worker_processes: "dict[int, subprocess.Popen]" = {}
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -6916,6 +6948,17 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
+    if not hasattr(os, "WIFEXITED"):
+        # Windows has no WIFEXITED helpers.  Keep the registry's existing
+        # wait-status contract and decode the conventional ``code << 8``
+        # representation ourselves.  This also keeps direct tests and any
+        # cross-platform callers of ``_record_worker_exit`` deterministic.
+        code = int(raw >> 8) if raw >= 0 and raw % 256 == 0 else int(raw)
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -6935,10 +6978,25 @@ def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    children (returns []). On Windows, polls the retained Popen handles because
+    that platform has no waitpid/WIFEXITED API.
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    if os.name == "nt":
+        for pid, proc in list(_windows_worker_processes.items()):
+            try:
+                status = proc.poll()
+            except Exception:
+                continue
+            if status is None:
+                continue
+            # Store the same wait-status representation used on POSIX so
+            # classification and tests do not depend on the host API shape.
+            encoded_status = int(status) << 8 if int(status) >= 0 else int(status)
+            _record_worker_exit(pid, encoded_status)
+            _windows_worker_processes.pop(pid, None)
+            reaped.append(pid)
+    else:
         try:
             while True:
                 try:
@@ -7018,11 +7076,45 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _terminate_worker_process_tree(pid: int, *, force: bool) -> None:
+    """Signal the exact dispatcher-owned worker tree on Windows and POSIX."""
+    import signal
+
+    pid = int(pid)
+    if _IS_WINDOWS:
+        cmd = ["taskkill", "/T", "/PID", str(pid)]
+        if force:
+            cmd.insert(1, "/F")
+        subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return
+
+    sig = getattr(signal, "SIGKILL", signal.SIGTERM) if force else signal.SIGTERM
+    try:
+        getpgid = getattr(os, "getpgid")
+        killpg = getattr(os, "killpg")
+        pgid = getpgid(pid)
+        if pgid == pid:
+            killpg(pgid, sig)
+            return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    os.kill(pid, sig)
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    process_tree_fn=None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
     import signal
@@ -7042,22 +7134,22 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
-    if kill is None:
-        return info
+    tree_kill = process_tree_fn or _terminate_worker_process_tree
+    kill = signal_fn
 
     info["termination_attempted"] = True
     try:
-        kill(int(pid), signal.SIGTERM)
+        if kill is not None:
+            kill(int(pid), signal.SIGTERM)
+        else:
+            tree_kill(int(pid), force=False)
     except ProcessLookupError:
         # Process is already gone — that's a successful termination, not a
         # survival. Leaving terminated=False here would make the reclaim guard
         # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
         return info
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         return info
 
     for _ in range(10):
@@ -7071,9 +7163,12 @@ def _terminate_reclaimed_worker(
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
             _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
+            if kill is not None:
+                kill(int(pid), _sigkill)
+            else:
+                tree_kill(int(pid), force=True)
             info["sigkill"] = True
-        except (ProcessLookupError, OSError):
+        except (ProcessLookupError, OSError, subprocess.SubprocessError):
             return info
 
     info["terminated"] = not _pid_alive(pid)
@@ -7205,7 +7300,6 @@ def enforce_max_runtime(
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7213,7 +7307,7 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, t.current_run_id "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -7233,31 +7327,25 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                lock,
+                now,
+                termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
+        if row["current_run_id"] is not None:
+            termination["session_finalized"] = _finalize_worker_session_lineage(
+                worker_session_id(tid, int(row["current_run_id"])),
+                reason="kanban_timed_out",
+            )
+        killed = bool(termination.get("sigkill"))
 
         with write_txn(conn):
             cur = conn.execute(
@@ -7275,6 +7363,7 @@ def enforce_max_runtime(
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
                 }
+                payload.update(termination)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -7346,6 +7435,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -7383,6 +7473,12 @@ def detect_stale_running(
                 reason="heartbeat_stale_worker_alive",
             )
             continue
+
+        if row["current_run_id"] is not None:
+            termination["session_finalized"] = _finalize_worker_session_lineage(
+                worker_session_id(tid, int(row["current_run_id"])),
+                reason="kanban_stale_reclaim",
+            )
 
         with write_txn(conn):
             cur = conn.execute(
@@ -7464,7 +7560,7 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, current_run_id FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
@@ -7500,6 +7596,11 @@ def reconcile_orphaned_running(
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }
+            if row["current_run_id"] is not None:
+                payload["session_finalized"] = _finalize_worker_session_lineage(
+                    worker_session_id(tid, int(row["current_run_id"])),
+                    reason="kanban_orphan_reconciled",
+                )
             run_id = _end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
@@ -7649,7 +7750,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_run_id FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7741,6 +7842,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                if row["current_run_id"] is not None:
+                    event_payload["session_finalized"] = (
+                        _finalize_worker_session_lineage(
+                            worker_session_id(row["id"], int(row["current_run_id"])),
+                            reason="kanban_worker_crashed",
+                        )
+                    )
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
@@ -7890,6 +7998,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -7939,10 +8048,12 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if expected_run_id is not None and row["current_run_id"] != expected_run_id:
             return False
         failures = int(row["consecutive_failures"]) + 1
 
@@ -8295,6 +8406,41 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _materialize_worker_runtime_limit(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    default_max_runtime_seconds: int,
+) -> None:
+    """Persist a finite runtime on a claimed task/run before spawning it."""
+    if task.max_runtime_seconds is not None:
+        return
+    limit = _positive_int(
+        default_max_runtime_seconds,
+        DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
+    )
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = ? "
+            "WHERE id = ? AND max_runtime_seconds IS NULL",
+            (limit, task.id),
+        )
+        if task.current_run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET max_runtime_seconds = ? "
+                "WHERE id = ? AND max_runtime_seconds IS NULL",
+                (limit, task.current_run_id),
+            )
+        _append_event(
+            conn,
+            task.id,
+            "worker_limits_applied",
+            {"max_runtime_seconds": limit},
+            run_id=task.current_run_id,
+        )
+    task.max_runtime_seconds = limit
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -8308,6 +8454,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    default_max_runtime_seconds: int = DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -8343,6 +8490,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            default_max_runtime_seconds=default_max_runtime_seconds,
             reconcile_orphans=reconcile_orphans,
         )
     with _dispatch_tick_lock(db_path) as held:
@@ -8360,6 +8508,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            default_max_runtime_seconds=default_max_runtime_seconds,
             reconcile_orphans=reconcile_orphans,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
@@ -8381,6 +8530,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    default_max_runtime_seconds: int = DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -8634,6 +8784,11 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        _materialize_worker_runtime_limit(
+            conn,
+            claimed,
+            default_max_runtime_seconds=default_max_runtime_seconds,
+        )
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -8726,6 +8881,11 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        _materialize_worker_runtime_limit(
+            conn,
+            claimed,
+            default_max_runtime_seconds=default_max_runtime_seconds,
+        )
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -8809,6 +8969,79 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
         minimum=0,
     )
     return max_bytes, backup_count
+
+
+def worker_runtime_limits_config(
+    kanban_cfg: Optional[dict] = None,
+) -> tuple[int, int]:
+    """Return finite ``(max_api_turns, max_total_tokens)`` worker limits."""
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config().get("kanban") or {})
+        except Exception:
+            kanban_cfg = {}
+    cfg = kanban_cfg or {}
+    return (
+        _positive_int(
+            cfg.get("worker_max_api_turns"),
+            DEFAULT_WORKER_MAX_API_TURNS,
+        ),
+        _positive_int(
+            cfg.get("worker_max_total_tokens"),
+            DEFAULT_WORKER_MAX_TOTAL_TOKENS,
+        ),
+    )
+
+
+def worker_session_id(task_id: str, run_id: int) -> str:
+    """Return the deterministic state.db session id owned by one worker run."""
+    safe_task = "".join(ch for ch in str(task_id) if ch.isalnum() or ch in "_-")
+    return f"kanban_{safe_task}_{int(run_id)}"
+
+
+def _finalize_worker_session_lineage(session_id: str, *, reason: str) -> bool:
+    """End the live compression tip and stamp terminal activity after reclaim."""
+    if not session_id:
+        return False
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            state_conn = db._conn
+            if state_conn is None:
+                return False
+            row = state_conn.execute(
+                "SELECT id, ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            tip_id = session_id
+            seen = {tip_id}
+            while row["ended_at"] is not None and row["end_reason"] == "compression":
+                child = db.find_live_compression_child(tip_id)
+                if not child or child["id"] in seen:
+                    break
+                tip_id = str(child["id"])
+                seen.add(tip_id)
+                row = child
+            if row["ended_at"] is None:
+                db.touch_session_activity(tip_id, description=reason)
+                db.end_session(tip_id, reason)
+            return True
+        finally:
+            db.close()
+    except Exception as exc:
+        _log.warning(
+            "kanban reclaim: failed to finalize worker session %s: %s",
+            session_id,
+            exc,
+        )
+        return False
 
 
 def _rotated_log_path(log_path: Path, generation: int) -> Path:
@@ -9147,8 +9380,14 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+        env["HERMES_KANBAN_WORKER_SESSION_ID"] = worker_session_id(
+            task.id, task.current_run_id,
+        )
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    max_api_turns, max_total_tokens = worker_runtime_limits_config()
+    env["HERMES_KANBAN_MAX_API_TURNS"] = str(max_api_turns)
+    env["HERMES_KANBAN_MAX_TOTAL_TOKENS"] = str(max_total_tokens)
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -9233,6 +9472,7 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        "--max-turns", str(max_api_turns),
         "-q", prompt,
     ])
     if task.goal_mode:
@@ -9251,10 +9491,21 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    env["HERMES_KANBAN_WORKER_LOG"] = str(log_path)
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
-    log_f = open(log_path, "ab")
+    log_f = open(log_path, "ab", buffering=0)
+    launch_line = (
+        f"[{int(time.time())}] worker_spawned task={task.id} "
+        f"run={task.current_run_id or '-'} max_runtime={task.max_runtime_seconds or '-'} "
+        f"max_api_turns={max_api_turns} max_total_tokens={max_total_tokens}\n"
+    )
+    log_f.write(launch_line.encode("utf-8", errors="replace"))
+    os.fsync(log_f.fileno())
     try:
+        creationflags = 0
+        if _IS_WINDOWS:
+            creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
@@ -9263,8 +9514,10 @@ def _default_spawn(
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            creationflags=creationflags,
         )
+        if _IS_WINDOWS:
+            _windows_worker_processes[proc.pid] = proc
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(

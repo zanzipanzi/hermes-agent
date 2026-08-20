@@ -1492,6 +1492,11 @@ def init_agent(
     if session_id:
         # Use provided session ID (e.g., from CLI)
         agent.session_id = session_id
+    elif os.environ.get("HERMES_KANBAN_WORKER_SESSION_ID"):
+        # Dispatcher-owned workers use a deterministic per-run id so stale
+        # reclaim can finalize the exact state.db lineage after terminating
+        # the process tree. This env is scrubbed from non-worker launches.
+        agent.session_id = os.environ["HERMES_KANBAN_WORKER_SESSION_ID"]
     else:
         # Generate a new session ID
         timestamp_str = agent.session_start.strftime("%Y%m%d_%H%M%S")
