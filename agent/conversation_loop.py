@@ -1523,6 +1523,12 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
+    # Runtime-only telemetry for this user turn. Do not derive these values
+    # from ``messages`` in the finalizer: compaction rewrites retained history,
+    # and resumed sessions already contain tool-call rows from older turns.
+    current_turn_tool_cycles = 0
+    current_turn_tool_calls = 0
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -6402,6 +6408,8 @@ def run_conversation(
                         if tc.function.name not in agent.valid_tool_names
                     ]
 
+                current_turn_tool_cycles += 1
+                current_turn_tool_calls += len(assistant_message.tool_calls)
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
                 turn_content = assistant_message.content or ""
@@ -7553,6 +7561,8 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
+        current_turn_tool_cycles=current_turn_tool_cycles,
+        current_turn_tool_calls=current_turn_tool_calls,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )

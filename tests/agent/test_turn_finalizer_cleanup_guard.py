@@ -106,6 +106,8 @@ def _run(
     final_response=None,
     api_call_count=3,
     turn_exit_reason="unknown",
+    current_turn_tool_cycles=None,
+    current_turn_tool_calls=None,
 ):
     messages = [
         {"role": "user", "content": "do a thing"},
@@ -118,6 +120,11 @@ def _run(
         },
         {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
     ]
+    kwargs = {}
+    if current_turn_tool_cycles is not None:
+        kwargs["current_turn_tool_cycles"] = current_turn_tool_cycles
+    if current_turn_tool_calls is not None:
+        kwargs["current_turn_tool_calls"] = current_turn_tool_calls
     return finalize_turn(
         agent,
         final_response=final_response,
@@ -132,6 +139,7 @@ def _run(
         original_user_message="do a thing",
         _should_review_memory=False,
         _turn_exit_reason=turn_exit_reason,
+        **kwargs,
     )
 
 
@@ -162,5 +170,27 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
+
+
+def test_turn_diagnostic_uses_runtime_tool_cycle_count(caplog):
+    agent = _StubAgent(raise_in=())
+
+    with caplog.at_level("INFO", logger="agent.conversation_loop"):
+        _run(
+            agent,
+            final_response="done",
+            api_call_count=2,
+            turn_exit_reason="text_response(finish_reason=stop)",
+            current_turn_tool_cycles=2,
+            current_turn_tool_calls=3,
+        )
+
+    turn_end_records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Turn ended:")
+    ]
+    assert len(turn_end_records) == 1
+    assert "tool_cycles=2 tool_calls=3" in turn_end_records[0]
 
 

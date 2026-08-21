@@ -81,6 +81,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    current_turn_tool_cycles=0,
+    current_turn_tool_calls=0,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
@@ -455,22 +457,19 @@ def finalize_turn(
                     _last_tool_name = _tcs[-1].get("function", {}).get("name")
                 break
 
-    _turn_tool_count = sum(
-        1 for m in messages
-        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
-    )
     _resp_len = len(final_response) if final_response else 0
     _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
     _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
 
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
-        "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
+        "tool_cycles=%d tool_calls=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
         _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
         _budget_used, _budget_max,
-        _turn_tool_count, _last_msg_role, _resp_len,
+        current_turn_tool_cycles, current_turn_tool_calls,
+        _last_msg_role, _resp_len,
         agent.session_id or "none",
     )
 
