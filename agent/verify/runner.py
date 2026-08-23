@@ -235,44 +235,41 @@ def _poll_readiness(url: str, timeout: float, interval: float = 1.0) -> tuple[bo
     return False, None, last_error
 
 
-def _terminate_process_group(proc: subprocess.Popen) -> None:
-    """Terminate the started app and its whole process group cleanly.
+def _listener_pids(port: int) -> list[int]:
+    """PIDs of processes listening on 127.0.0.1/0.0.0.0 ``port`` (best effort).
 
-    On POSIX the child is spawned with ``start_new_session=True`` so we can
-    signal the whole group; on Windows (no ``os.killpg``) we fall back to
-    terminating just the direct child.
+    Returns ``[]`` when nothing is listening; raises nothing — platforms we
+    can't inspect fall through to the caller's post-readiness ownership
+    proof, which is the authoritative fail-closed check.
     """
-    if proc.poll() is not None:
-        return
-    killpg = getattr(os, "killpg", None)
-    getpgid = getattr(os, "getpgid", None)
-    pgid = None
-    if killpg is not None and getpgid is not None:
-        try:
-            pgid = getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
     try:
-        if pgid is not None and killpg is not None:
-            killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch (killpg checked above)
-        else:
-            proc.terminate()
-    except (ProcessLookupError, PermissionError):
-        return
+        import psutil
+
+        pids = set()
+        for conn in psutil.net_connections(kind="inet"):
+            if (
+                conn.status == psutil.CONN_LISTEN
+                and conn.laddr
+                and conn.laddr.port == port
+                and conn.pid
+            ):
+                pids.add(conn.pid)
+        return sorted(pids)
+    except Exception:
+        return []
+
+
+def _owned_pids(root_pid: int) -> set[int]:
+    """The root PID plus all of its live descendants (snapshot)."""
+    import psutil
+
+    owned = {root_pid}
     try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        try:
-            if pgid is not None and killpg is not None:
-                killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only branch (killpg checked above)
-            else:
-                proc.kill()
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+        for child in psutil.Process(root_pid).children(recursive=True):
+            owned.add(child.pid)
+    except Exception:
+        pass
+    return owned
 
 
 def _run_start_phase(
@@ -285,6 +282,24 @@ def _run_start_phase(
     port = port_override or recipe.port or 8000
     url = f"http://127.0.0.1:{port}{recipe.readiness_path}"
     started = time.monotonic()
+
+    # Fail closed BEFORE spawn: a pre-existing listener must never count as
+    # our readiness, and Eleventy-class dev servers silently advance to the
+    # next free port when the requested one is taken — which is how a stale
+    # listener manufactured false "ready" verdicts and orphaned servers.
+    existing = _listener_pids(port)
+    if existing:
+        return ReadinessResult(
+            url=url,
+            ready=False,
+            status_code=None,
+            duration=time.monotonic() - started,
+            error=(
+                f"port {port} already in use (listener pid "
+                f"{', '.join(str(p) for p in existing)}); refusing to start"
+            ),
+        )
+
     proc = subprocess.Popen(
         recipe.start,
         shell=True,  # project-authored command; see module docstring
@@ -295,11 +310,33 @@ def _run_start_phase(
         text=True,
         errors="replace",
     )
+    identity = capture_process_identity(proc.pid)
     output = ""
     try:
         ready, status, error = _poll_readiness(url, ready_timeout)
+        if ready:
+            # The URL answering is not enough: prove the listener belongs to
+            # the tree we just spawned. A foreign listener (race with an
+            # unrelated process binding between our preflight and now, or a
+            # server that silently relocated to another port) must fail
+            # readiness, never pass it.
+            listeners = _listener_pids(port)
+            owned = _owned_pids(proc.pid)
+            if not listeners or not set(listeners).issubset(owned):
+                ready, status = False, None
+                error = (
+                    f"listener on port {port} not owned by started process "
+                    f"(listener pids {listeners}, owned pids {sorted(owned)})"
+                )
     finally:
-        _terminate_process_group(proc)
+        # Reap the whole owned tree — killing only the direct shell leaves
+        # grandchildren (npm → cmd → eleventy) alive holding the stdout pipe,
+        # wedging the read below forever.
+        terminate_process_tree(identity)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
         try:
             if proc.stdout is not None:
                 output = proc.stdout.read() or ""

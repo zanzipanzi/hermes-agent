@@ -166,8 +166,16 @@ class TestReadiness:
         assert result.readiness is None
         assert not result.ok
 
-    def test_port_override(self, tmp_path):
+    def test_start_refuses_port_occupied_before_spawn(self, tmp_path):
+        """A pre-existing listener must make verify fail closed, fast.
+
+        The start command must never even run: Eleventy-class dev servers
+        silently advance to the next free port when the requested one is
+        taken, which is exactly how a stale listener manufactured false
+        readiness and orphaned servers.
+        """
         port = _free_port()
+        ran_marker = tmp_path / "start_ran.txt"
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
@@ -182,15 +190,88 @@ class TestReadiness:
         thread.start()
         time.sleep(0.05)
         try:
-            recipe = Recipe(name="x", start="sleep 30", port=1)
-            result = run_verify(
-                tmp_path, recipe, phases=("start",), ready_timeout=10, port_override=port
+            recipe = Recipe(
+                name="x",
+                start=f'echo started > "{ran_marker}"',
+                port=1,
             )
-            assert result.readiness.ready
-            assert result.readiness.status_code == 204
+            result = run_verify(
+                tmp_path,
+                recipe,
+                phases=("start",),
+                ready_timeout=10,
+                port_override=port,
+            )
+            assert result.readiness is not None
+            assert not result.readiness.ready
+            assert "already in use" in (result.readiness.error or "")
+            assert not ran_marker.exists(), (
+                "start command must not execute when the port is occupied"
+            )
         finally:
             server.shutdown()
             thread.join(timeout=5)
+
+    def test_existing_listener_never_counts_as_spawned_readiness(
+        self, tmp_path
+    ):
+        """An unrelated 204 responder must not make a sleeping start 'ready'."""
+        port = _free_port()
+        marker = tmp_path / "child_pid.txt"
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        time.sleep(0.05)
+        try:
+            recipe = Recipe(
+                name="x", start=_fixture_tree_command(marker), port=port
+            )
+            result = run_verify(
+                tmp_path, recipe, phases=("start",), ready_timeout=10
+            )
+            assert result.readiness is not None
+            assert not result.readiness.ready
+            assert not result.ok
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            _reap_fixture_processes(marker)
+
+    def test_free_port_still_passes_live_server_readiness(self, tmp_path):
+        """The happy path must keep working: our own serving tree counts."""
+        port = _free_port()
+        marker = tmp_path / "child_pid.txt"
+        recipe = Recipe(
+            name="x",
+            start=(
+                f'"{sys.executable}" '
+                f'"{Path(__file__).resolve().parents[1] / "fixtures" / "verify_process_tree.py"}" '
+                f'"{marker}" --serve {port}'
+            ),
+            port=port,
+        )
+        try:
+            result = run_verify(
+                tmp_path, recipe, phases=("start",), ready_timeout=30
+            )
+            assert result.readiness is not None
+            assert result.readiness.ready
+            assert result.ok
+            child_pid = _read_pid_marker(marker)
+            assert _wait_until_pid_gone(child_pid, timeout=15.0), (
+                "serving child must be torn down with the owned tree"
+            )
+        finally:
+            _reap_fixture_processes(marker)
 
 
 # ---------------------------------------------------------------------------
@@ -235,27 +316,28 @@ def _wait_until_pid_gone(pid: int, timeout: float, interval: float = 0.05) -> bo
 
 
 def _reap_fixture_processes(marker: Path) -> None:
-    """Best-effort teardown of only this test's fixture tree (see block doc)."""
+    """Best-effort teardown of only this test's fixture tree (see block doc).
+
+    Kills only processes whose own command line proves ownership: the
+    fixture-script path (wrappers/parents) or the embedded ``vpt-marker``
+    tag (children). Marker-file PIDs are never signalled blindly — Windows
+    recycles PIDs, and a recycled number must never be killed.
+    """
     import psutil
     from tools.process_lifecycle import (
         capture_process_identity,
         terminate_process_tree,
     )
 
-    needle = str(marker)
+    needles = (str(marker), "# vpt-marker", "verify_process_tree.py")
     targets: list[int] = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
             cmdline = " ".join(proc.info["cmdline"] or [])
         except Exception:
             continue
-        if needle in cmdline:
+        if any(n in cmdline for n in needles) and proc.info["pid"] != 0:
             targets.append(proc.info["pid"])
-    if marker.exists():
-        try:
-            targets.append(int(marker.read_text(encoding="utf-8").strip()))
-        except (OSError, ValueError):
-            pass
     for pid in targets:
         try:
             if psutil.pid_exists(pid):

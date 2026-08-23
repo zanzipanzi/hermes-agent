@@ -31,12 +31,17 @@ def main() -> None:
 
     if port is not None:
         child_code = (
+            "# vpt-marker\n"
             "import http.server\n"
             f"http.server.HTTPServer(('127.0.0.1', {port}), "
             "http.server.BaseHTTPRequestHandler).serve_forever()\n"
         )
     else:
-        child_code = "import time\n[time.sleep(1) for _ in iter(int, 1)]\n"
+        child_code = (
+            "# vpt-marker\n"
+            "import time\n"
+            "[time.sleep(1) for _ in iter(int, 1)]\n"
+        )
 
     child = subprocess.Popen([sys.executable, "-c", child_code])
     marker.write_text(str(child.pid), encoding="utf-8")
