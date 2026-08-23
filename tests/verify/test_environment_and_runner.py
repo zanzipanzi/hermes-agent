@@ -2,8 +2,12 @@
 
 import http.server
 import json
+import sys
 import threading
 import time
+from pathlib import Path
+
+import pytest
 
 from agent.verify.environment import (
     load_manifest,
@@ -187,3 +191,108 @@ class TestReadiness:
         finally:
             server.shutdown()
             thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Owned-tree phase execution — a phase timeout must reap the whole tree.
+# Every helper here kills only processes this file spawned: parents are
+# identified by the unique marker path in their command line, nested children
+# by the PID recorded in the marker file, and every kill goes through the
+# PID+start-time guarded lifecycle seam. If ownership can't be proven, the
+# process is left alone.
+# ---------------------------------------------------------------------------
+
+
+def _fixture_tree_command(marker: Path, token: str = "FIXTURE-READY") -> str:
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "verify_process_tree.py"
+    return f'"{sys.executable}" "{fixture}" "{marker}" --token {token}'
+
+
+def _read_pid_marker(marker: Path, timeout: float = 10.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if marker.exists():
+            text = marker.read_text(encoding="utf-8").strip()
+            if text:
+                return int(text)
+        time.sleep(0.05)
+    pytest.fail(f"fixture parent never wrote its child PID to {marker}")
+
+
+def _pid_gone(pid: int) -> bool:
+    import psutil
+
+    return not psutil.pid_exists(pid)
+
+
+def _wait_until_pid_gone(pid: int, timeout: float, interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _pid_gone(pid):
+            return True
+        time.sleep(interval)
+    return _pid_gone(pid)
+
+
+def _reap_fixture_processes(marker: Path) -> None:
+    """Best-effort teardown of only this test's fixture tree (see block doc)."""
+    import psutil
+    from tools.process_lifecycle import (
+        capture_process_identity,
+        terminate_process_tree,
+    )
+
+    needle = str(marker)
+    targets: list[int] = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = " ".join(proc.info["cmdline"] or [])
+        except Exception:
+            continue
+        if needle in cmdline:
+            targets.append(proc.info["pid"])
+    if marker.exists():
+        try:
+            targets.append(int(marker.read_text(encoding="utf-8").strip()))
+        except (OSError, ValueError):
+            pass
+    for pid in targets:
+        try:
+            if psutil.pid_exists(pid):
+                terminate_process_tree(capture_process_identity(pid))
+        except Exception:
+            pass
+
+
+class TestPhaseTimeoutTreeReaping:
+    def test_phase_timeout_kills_nested_child_tree(self, tmp_path):
+        marker = tmp_path / "child_pid.txt"
+        recipe = Recipe(name="x", test=[_fixture_tree_command(marker)])
+        try:
+            result = run_verify(
+                tmp_path, recipe, phase_timeout=2.0, skip_start=True
+            )
+            phase = result.phases[0]
+            assert phase.timed_out
+            child_pid = _read_pid_marker(marker)
+            assert _wait_until_pid_gone(child_pid, timeout=15.0), (
+                f"nested child pid {child_pid} survived the phase timeout"
+            )
+        finally:
+            _reap_fixture_processes(marker)
+
+    def test_phase_timeout_preserves_output_tail(self, tmp_path):
+        marker = tmp_path / "child_pid.txt"
+        token = "FIXTURE-TOKEN-7f3a"
+        recipe = Recipe(
+            name="x", test=[_fixture_tree_command(marker, token=token)]
+        )
+        try:
+            result = run_verify(
+                tmp_path, recipe, phase_timeout=2.0, skip_start=True
+            )
+            phase = result.phases[0]
+            assert phase.timed_out
+            assert token in phase.output_tail
+        finally:
+            _reap_fixture_processes(marker)

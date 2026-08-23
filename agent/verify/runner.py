@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -23,10 +24,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent.verify.recipes import Recipe
+from tools.process_lifecycle import (
+    TerminationStatus,
+    capture_process_identity,
+    terminate_process_tree,
+)
 
 DEFAULT_PHASE_TIMEOUT = 600.0
 DEFAULT_READY_TIMEOUT = 60.0
 _TAIL_CHARS = 2000
+# Hard bound on captured phase output. ``on_output`` historically received
+# the full stream; this cap keeps a runaway chatty command from growing the
+# buffer indefinitely while staying far above anything a real build emits.
+_OUTPUT_CAPTURE_CAP = 200_000
 PHASE_ORDER = ("bootstrap", "build", "test")
 
 
@@ -38,6 +48,7 @@ class PhaseResult:
     duration: float
     output_tail: str
     timed_out: bool = False
+    teardown_failed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -51,6 +62,7 @@ class PhaseResult:
             "duration": round(self.duration, 3),
             "ok": self.ok,
             "timedOut": self.timed_out,
+            "teardownFailed": self.teardown_failed,
             "outputTail": self.output_tail,
         }
 
@@ -107,29 +119,81 @@ def _run_phase_command(
     timeout: float,
     on_output: Callable[[str], None] | None = None,
 ) -> PhaseResult:
+    """Run one phase command as an owned process tree.
+
+    Unlike a bare ``subprocess.run(..., timeout=...)`` — which on Windows
+    kills only the direct ``cmd.exe`` wrapper and then blocks forever in an
+    unbounded ``communicate()`` while surviving grandchildren hold the stdout
+    pipe — this helper:
+
+    - captures the wrapper's PID identity (PID + kernel start time) up front;
+    - continuously drains combined stdout/stderr into a bounded buffer from a
+      reader thread, so a chatty child can never wedge the pipe;
+    - waits against a monotonic deadline and, on timeout, reaps the *whole*
+      owned tree via the shared lifecycle seam;
+    - returns only after bounded teardown verification and reports a
+      ``teardown_failed`` phase instead of silently claiming completion.
+    """
     started = time.monotonic()
+    proc = subprocess.Popen(
+        command,
+        shell=True,  # project-authored commands; see module docstring
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+    )
+    identity = capture_process_identity(proc.pid)
+
+    chunks: list[str] = []
+    captured = 0
+    reader_done = threading.Event()
+
+    def _drain() -> None:
+        nonlocal captured
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                chunks.append(line)
+                captured += len(line)
+                while captured > _OUTPUT_CAPTURE_CAP and len(chunks) > 1:
+                    captured -= len(chunks[0])
+                    chunks.pop(0)
+                if captured > _OUTPUT_CAPTURE_CAP and chunks:
+                    chunks[0] = chunks[0][captured - _OUTPUT_CAPTURE_CAP :]
+                    captured = _OUTPUT_CAPTURE_CAP
+        except (OSError, ValueError):
+            pass
+        finally:
+            reader_done.set()
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+
+    exit_code: int | None = None
+    timed_out = False
+    teardown_failed = False
     try:
-        proc = subprocess.run(
-            command,
-            shell=True,  # project-authored commands; see module docstring
-            cwd=str(root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            text=True,
-            errors="replace",
-        )
-        output = proc.stdout or ""
-        exit_code: int | None = proc.returncode
-        timed_out = False
-    except subprocess.TimeoutExpired as exc:
-        raw = exc.output
-        if isinstance(raw, bytes):
-            output = raw.decode("utf-8", errors="replace")
-        else:
-            output = raw or ""
-        exit_code = None
+        exit_code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
         timed_out = True
+        reap = terminate_process_tree(identity)
+        if reap.status is TerminationStatus.failed:
+            teardown_failed = True
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            teardown_failed = True
+        if not teardown_failed:
+            # Bounded verification that the tree is actually gone; report a
+            # failed teardown instead of claiming completion.
+            teardown_failed = not _pid_gone_within(identity.pid, 5.0)
+
+    # Bounded reader shutdown: EOF arrives once every writer in the tree is
+    # dead. A wedged reader must never wedge teardown in turn.
+    reader_done.wait(timeout=5.0)
+    output = "".join(chunks)[-_OUTPUT_CAPTURE_CAP:]
+
     duration = time.monotonic() - started
     if on_output and output:
         on_output(output)
@@ -140,7 +204,19 @@ def _run_phase_command(
         duration=duration,
         output_tail=_tail(output),
         timed_out=timed_out,
+        teardown_failed=teardown_failed,
     )
+
+
+def _pid_gone_within(pid: int, timeout: float, interval: float = 0.05) -> bool:
+    import psutil
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not psutil.pid_exists(pid):
+            return True
+        time.sleep(interval)
+    return not psutil.pid_exists(pid)
 
 
 def _poll_readiness(url: str, timeout: float, interval: float = 1.0) -> tuple[bool, int | None, str | None]:
