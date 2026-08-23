@@ -1132,6 +1132,7 @@ class TestTerminateHostPidWindows:
 
     def test_windows_invokes_taskkill_with_tree_and_force_flags(self, monkeypatch):
         """The Windows branch must shell out to ``taskkill /PID N /T /F``."""
+        from tools import process_lifecycle as pl
         from tools import process_registry as pr
 
         captured = {}
@@ -1141,8 +1142,11 @@ class TestTerminateHostPidWindows:
             captured["kwargs"] = kwargs
             return MagicMock(returncode=0, stderr="", stdout="")
 
+        # The branch flag now lives in the shared lifecycle seam; patch both
+        # modules so the assertion holds on POSIX CI as well.
         monkeypatch.setattr(pr, "_IS_WINDOWS", True)
-        monkeypatch.setattr(pr.subprocess, "run", fake_run)
+        monkeypatch.setattr(pl, "_IS_WINDOWS", True)
+        monkeypatch.setattr(pl.subprocess, "run", fake_run)
 
         pr.ProcessRegistry._terminate_host_pid(12345)
 
@@ -1156,6 +1160,7 @@ class TestTerminateHostPidPosix:
     """POSIX branch walks the tree via psutil and SIGTERMs children first."""
 
     def test_posix_walks_tree_and_terminates_children_then_parent(self, monkeypatch):
+        from tools import process_lifecycle as pl
         from tools import process_registry as pr
         import psutil
 
@@ -1180,6 +1185,7 @@ class TestTerminateHostPidPosix:
                 terminate_order.append(self.pid)
 
         monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(pl, "_IS_WINDOWS", False)
         monkeypatch.setattr(psutil, "Process", _FakeParent)
         # This test covers only the SIGTERM tree-walk ordering; disable the
         # SIGKILL-escalation step (which would call psutil.wait_procs on the
@@ -1194,6 +1200,7 @@ class TestTerminateHostPidPosix:
         )
 
     def test_posix_oserror_falls_back_to_os_kill(self, monkeypatch):
+        from tools import process_lifecycle as pl
         from tools import process_registry as pr
         import psutil
 
@@ -1206,6 +1213,7 @@ class TestTerminateHostPidPosix:
             kill_calls.append((pid, sig))
 
         monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(pl, "_IS_WINDOWS", False)
         monkeypatch.setattr(psutil, "Process", boom)
         monkeypatch.setattr(pr.os, "kill", fake_kill)
 

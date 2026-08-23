@@ -550,129 +550,20 @@ class ProcessRegistry:
     def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
         """Terminate a host-visible PID and its descendants.
 
-        ``expected_start`` is the kernel start time captured when we spawned the
-        process. When provided, it is re-validated against the live PID before
-        any signal is sent; a mismatch (or a dead PID) means the number was
-        recycled onto an unrelated process and we refuse to touch it, so a stale
-        background-session PID can never tree-kill a browser or other stranger.
-
-        POSIX: walks the process tree with ``psutil`` and SIGTERMs
-        children before the parent so subprocess trees (e.g. Chromium
-        renderers/GPU helpers spawned by an ``agent-browser`` daemon)
-        don't get reparented to init and survive cleanup.  After a bounded
-        grace window (``terminal.daemon_term_grace_seconds``) any tree member
-        that ignored SIGTERM — a daemon stalled in its signal handler — is
-        escalated to SIGKILL so it can't leak indefinitely.  Set the grace to
-        0 to disable escalation (SIGTERM only).
-
-        Windows: shells out to ``taskkill /PID <pid> /T /F``. This is
-        the documented Microsoft primitive for tree-kill and matches the
-        existing convention in ``gateway.status.terminate_pid``.  ``/F`` is
-        already a hard kill, so no separate escalation step is needed.  We
-        can't reuse the POSIX psutil path on Windows because:
-
-          1. Windows doesn't maintain a Unix-style process tree —
-             ``psutil.Process.children(recursive=True)`` walks PPID
-             links that go stale when intermediate processes exit, so
-             enumeration is best-effort and misses orphaned descendants.
-          2. ``psutil.Process.terminate()`` on Windows is
-             ``TerminateProcess()`` which kills only the target handle
-             and is a hard kill — there is no Windows equivalent of a
-             SIGTERM that cascades through a process group. (See the
-             warning in ``gateway/status.py::terminate_pid``: "os.kill
-             with SIGTERM is not equivalent to a tree-killing hard stop"
-             on Windows.) Headless Chromium has no GUI window, so the
-             softer ``taskkill /T`` without ``/F`` won't reach it either.
-
-        ``psutil`` is a hard dependency (see ``pyproject.toml``); the
-        bare-``os.kill`` fallback covers OSError / PermissionError on
-        POSIX and a missing ``taskkill.exe`` on Windows (effectively
-        unreachable on real Windows installs, but cheap insurance).
+        Delegates to :func:`tools.process_lifecycle.terminate_process_tree` —
+        the shared, PID-reuse-safe seam extracted from this method. The
+        identity guard (``expected_start``), the Windows ``taskkill /T /F``
+        path, and the POSIX children-first SIGTERM → SIGKILL escalation all
+        live there now; see that module for the full platform rationale.
+        The POSIX grace window still comes from
+        ``terminal.daemon_term_grace_seconds`` in config.yaml.
         """
-        if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
-            # PID was recycled (start time changed) or is gone — never signal a
-            # stranger. A leaked orphan is strictly preferable to killing e.g.
-            # a browser whose session leader reused this dead session's PID.
-            logger.warning(
-                "Refusing to terminate host pid %d: start-time mismatch — "
-                "PID was recycled onto an unrelated process.", pid,
-            )
-            return
-        if _IS_WINDOWS:
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True, encoding='utf-8', errors='replace',
-                    timeout=10,
-                    creationflags=windows_hide_flags(),
-                    stdin=subprocess.DEVNULL,
-                )
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (OSError, ProcessLookupError, PermissionError):
-                    pass
-            return
+        from tools.process_lifecycle import ProcessIdentity, terminate_process_tree
 
-        import psutil
-        try:
-            parent = psutil.Process(pid)
-        except psutil.NoSuchProcess:
-            return
-        except (OSError, PermissionError):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError, PermissionError):
-                pass
-            return
-
-        # Snapshot the whole tree (children before parent) and SIGTERM each.
-        try:
-            targets = parent.children(recursive=True)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            targets = []
-        targets.append(parent)
-
-        for proc in targets:
-            try:
-                proc.terminate()
-            except psutil.NoSuchProcess:
-                pass
-            except (psutil.AccessDenied, OSError):
-                pass
-
-        # Escalate to SIGKILL for anything that ignored SIGTERM within the
-        # grace window — a daemon stalled in its signal handler would otherwise
-        # leak indefinitely.
-        grace = cls._daemon_term_grace_seconds()
-        if grace <= 0:
-            return
-        # Sleep out the grace window, then independently re-probe every target
-        # and SIGKILL any survivor.  We deliberately do NOT trust
-        # ``psutil.wait_procs``'s gone/alive partition here: it reaps via
-        # ``Process.wait()`` and can mis-partition when a target transitions
-        # through a zombie state or when reaping is racy across a parent/child
-        # tree, which left survivors un-killed.  A direct liveness re-probe is
-        # deterministic.
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            if not any(cls._proc_alive(_p) for _p in targets):
-                break
-            time.sleep(0.05)
-        for proc in targets:
-            try:
-                if not cls._proc_alive(proc):
-                    continue
-                proc.kill()  # SIGKILL on POSIX
-                logger.info(
-                    "Escalated to SIGKILL for pid %d (ignored SIGTERM within "
-                    "%.1fs grace)", proc.pid, grace,
-                )
-            except psutil.NoSuchProcess:
-                pass
-            except (psutil.AccessDenied, OSError):
-                pass
+        terminate_process_tree(
+            ProcessIdentity(pid=pid, start_time=expected_start),
+            grace_seconds=cls._daemon_term_grace_seconds(),
+        )
 
     # ----- Spawn -----
 

@@ -1632,11 +1632,21 @@ class LocalEnvironment(BaseEnvironment):
 
         try:
             if _IS_WINDOWS:
-                try:
-                    from gateway.status import terminate_pid
+                from tools.process_lifecycle import (
+                    TerminationStatus,
+                    capture_process_identity,
+                    terminate_process_tree,
+                )
 
-                    terminate_pid(proc.pid, force=True)
-                except Exception:
+                result = terminate_process_tree(
+                    capture_process_identity(proc.pid)
+                )
+                if result.status not in (
+                    TerminationStatus.terminated,
+                    TerminationStatus.already_exited,
+                ):
+                    # taskkill failed outright — same fallback the previous
+                    # terminate_pid(force=True)+except path provided.
                     proc.kill()
                 try:
                     proc.wait(timeout=2.0)
