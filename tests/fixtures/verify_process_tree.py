@@ -24,10 +24,22 @@ def main() -> None:
     argv = sys.argv[2:]
     port = None
     token = "FIXTURE-READY"
+    chatty_kb = 0
     if "--serve" in argv:
         port = int(argv[argv.index("--serve") + 1])
     if "--token" in argv:
         token = argv[argv.index("--token") + 1]
+    if "--chatty" in argv:
+        chatty_kb = int(argv[argv.index("--chatty") + 1])
+
+    # Chatty prelude: write more than any platform pipe buffer BEFORE the
+    # serving child exists. With no concurrent reader the pipe fills and this
+    # write blocks forever — the server never starts.
+    if chatty_kb:
+        line = "x" * 120 + "\n"
+        for _ in range(chatty_kb * 1024 // 121):
+            sys.stdout.write(line)
+        sys.stdout.flush()
 
     if port is not None:
         child_code = (

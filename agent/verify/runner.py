@@ -112,6 +112,55 @@ def _tail(text: str, limit: int = _TAIL_CHARS) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
+class _OutputDrain:
+    """Continuously drain a text pipe into a bounded buffer from a thread.
+
+    A chatty child (dev servers logging every request) can fill the OS pipe
+    buffer in kilobytes; without a concurrent reader the child blocks on its
+    own stdout and never becomes ready. Reading only after teardown both
+    wedged cleanup and lost the output. ``output()`` is bounded to
+    ``_OUTPUT_CAPTURE_CAP`` characters (front-trimmed, tail preserved); the
+    daemon reader can never hang its owner — ``wait()`` is bounded and a
+    broken/invalid pipe is swallowed.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._chunks: list[str] = []
+        self._captured = 0
+        self.done = threading.Event()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+
+    def _drain(self) -> None:
+        try:
+            for line in self._stream:
+                self._chunks.append(line)
+                self._captured += len(line)
+                while self._captured > _OUTPUT_CAPTURE_CAP and len(self._chunks) > 1:
+                    self._captured -= len(self._chunks[0])
+                    self._chunks.pop(0)
+                if self._captured > _OUTPUT_CAPTURE_CAP and self._chunks:
+                    self._chunks[0] = self._chunks[0][
+                        self._captured - _OUTPUT_CAPTURE_CAP :
+                    ]
+                    self._captured = _OUTPUT_CAPTURE_CAP
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.done.set()
+
+    def start(self) -> "_OutputDrain":
+        self._thread.start()
+        return self
+
+    def wait(self, timeout: float) -> None:
+        """Bounded reader shutdown; returns even if the pipe never EOFs."""
+        self.done.wait(timeout=timeout)
+
+    def output(self) -> str:
+        return "".join(self._chunks)[-_OUTPUT_CAPTURE_CAP:]
+
+
 def _run_phase_command(
     phase: str,
     command: str,
@@ -145,30 +194,7 @@ def _run_phase_command(
         errors="replace",
     )
     identity = capture_process_identity(proc.pid)
-
-    chunks: list[str] = []
-    captured = 0
-    reader_done = threading.Event()
-
-    def _drain() -> None:
-        nonlocal captured
-        try:
-            for line in proc.stdout:  # type: ignore[union-attr]
-                chunks.append(line)
-                captured += len(line)
-                while captured > _OUTPUT_CAPTURE_CAP and len(chunks) > 1:
-                    captured -= len(chunks[0])
-                    chunks.pop(0)
-                if captured > _OUTPUT_CAPTURE_CAP and chunks:
-                    chunks[0] = chunks[0][captured - _OUTPUT_CAPTURE_CAP :]
-                    captured = _OUTPUT_CAPTURE_CAP
-        except (OSError, ValueError):
-            pass
-        finally:
-            reader_done.set()
-
-    reader = threading.Thread(target=_drain, daemon=True)
-    reader.start()
+    drain = _OutputDrain(proc.stdout).start()
 
     exit_code: int | None = None
     timed_out = False
@@ -191,8 +217,8 @@ def _run_phase_command(
 
     # Bounded reader shutdown: EOF arrives once every writer in the tree is
     # dead. A wedged reader must never wedge teardown in turn.
-    reader_done.wait(timeout=5.0)
-    output = "".join(chunks)[-_OUTPUT_CAPTURE_CAP:]
+    drain.wait(timeout=5.0)
+    output = drain.output()
 
     duration = time.monotonic() - started
     if on_output and output:
@@ -311,7 +337,11 @@ def _run_start_phase(
         errors="replace",
     )
     identity = capture_process_identity(proc.pid)
-    output = ""
+    # Drain while readiness polls: a chatty dev server fills the OS pipe
+    # buffer in kilobytes and blocks on its own stdout — never becoming
+    # ready — unless something reads concurrently. Reading only after
+    # teardown also wedged cleanup whenever a survivor held the pipe.
+    drain = _OutputDrain(proc.stdout).start()
     try:
         ready, status, error = _poll_readiness(url, ready_timeout)
         if ready:
@@ -330,25 +360,21 @@ def _run_start_phase(
                 )
     finally:
         # Reap the whole owned tree — killing only the direct shell leaves
-        # grandchildren (npm → cmd → eleventy) alive holding the stdout pipe,
-        # wedging the read below forever.
+        # grandchildren (npm → cmd → eleventy) alive holding the stdout pipe.
         terminate_process_tree(identity)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
-        try:
-            if proc.stdout is not None:
-                output = proc.stdout.read() or ""
-        except (OSError, ValueError):
-            output = ""
+        # Bounded reader shutdown; the daemon thread can never hang us.
+        drain.wait(timeout=5.0)
     return ReadinessResult(
         url=url,
         ready=ready,
         status_code=status,
         duration=time.monotonic() - started,
         error=error,
-        output_tail=_tail(output),
+        output_tail=_tail(drain.output()),
     )
 
 

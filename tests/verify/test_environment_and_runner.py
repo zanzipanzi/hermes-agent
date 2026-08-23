@@ -378,3 +378,48 @@ class TestPhaseTimeoutTreeReaping:
             assert token in phase.output_tail
         finally:
             _reap_fixture_processes(marker)
+
+
+class TestStartOutputDraining:
+    def test_chatty_start_does_not_deadlock_and_returns_bounded_tail(
+        self, tmp_path
+    ):
+        """A noisy dev server must not block on a full stdout pipe.
+
+        The start tree writes 256 KiB before its HTTP child even exists.
+        Without a concurrent drain the pipe fills, the writer blocks, the
+        server never binds, and verify can never become ready.
+        """
+        from agent.verify.runner import _TAIL_CHARS
+
+        port = _free_port()
+        marker = tmp_path / "child_pid.txt"
+        token = "FINAL-MARKER-c3d1"
+        fixture = (
+            Path(__file__).resolve().parents[1] / "fixtures" / "verify_process_tree.py"
+        )
+        recipe = Recipe(
+            name="x",
+            start=(
+                f'"{sys.executable}" "{fixture}" "{marker}" '
+                f"--serve {port} --token {token} --chatty 256"
+            ),
+            port=port,
+        )
+        try:
+            result = run_verify(
+                tmp_path, recipe, phases=("start",), ready_timeout=30
+            )
+            assert result.readiness is not None
+            assert result.readiness.ready, (
+                f"chatty server never became ready: {result.readiness.error}"
+            )
+            tail = result.readiness.output_tail
+            assert token in tail
+            assert len(tail) <= _TAIL_CHARS
+            child_pid = _read_pid_marker(marker)
+            assert _wait_until_pid_gone(child_pid, timeout=15.0), (
+                "chatty serving child must be torn down with the owned tree"
+            )
+        finally:
+            _reap_fixture_processes(marker)
