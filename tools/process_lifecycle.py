@@ -135,6 +135,12 @@ def terminate_process_tree(
 
     if identity.start_time is not None:
         if not _pid_exists(pid):
+            logger.debug(
+                "Host pid %d already exited (start time %s on record); "
+                "nothing to terminate.",
+                pid,
+                identity.start_time,
+            )
             return TerminationResult(TerminationStatus.already_exited)
         if _current_start_time(pid) != identity.start_time:
             # PID was recycled (start time changed) — never signal a

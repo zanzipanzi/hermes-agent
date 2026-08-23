@@ -12,8 +12,7 @@ project's own checkout — the same trust level as the terminal tool.
 
 from __future__ import annotations
 
-import os
-import signal
+import socket
 import subprocess
 import threading
 import time
@@ -52,7 +51,7 @@ class PhaseResult:
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out
+        return self.exit_code == 0 and not self.timed_out and not self.teardown_failed
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -218,6 +217,12 @@ def _run_phase_command(
     # Bounded reader shutdown: EOF arrives once every writer in the tree is
     # dead. A wedged reader must never wedge teardown in turn.
     drain.wait(timeout=5.0)
+    if not drain.done.is_set() and exit_code is not None and not timed_out:
+        # The direct child exited 0 but something in its tree still holds the
+        # stdout pipe open — a backgrounded descendant leaked past the phase.
+        # We can no longer enumerate it through the dead root, so surface the
+        # leak instead of claiming a clean completion.
+        teardown_failed = True
     output = drain.output()
 
     duration = time.monotonic() - started
@@ -261,12 +266,15 @@ def _poll_readiness(url: str, timeout: float, interval: float = 1.0) -> tuple[bo
     return False, None, last_error
 
 
-def _listener_pids(port: int) -> list[int]:
-    """PIDs of processes listening on 127.0.0.1/0.0.0.0 ``port`` (best effort).
+def _listener_pids(port: int) -> tuple[list[int], bool]:
+    """PIDs listening on 127.0.0.1/0.0.0.0 ``port`` plus an inspection flag.
 
-    Returns ``[]`` when nothing is listening; raises nothing — platforms we
-    can't inspect fall through to the caller's post-readiness ownership
-    proof, which is the authoritative fail-closed check.
+    Returns ``([], True)`` when provably nothing is listening, ``(pids,
+    True)`` when inspection succeeded, and ``([], False)`` when the listener
+    table could not be read at all (e.g. non-root macOS raises AccessDenied
+    from psutil.net_connections). The ``False`` flag lets callers fall back
+    to a bind probe instead of mistaking "cannot inspect" for "nothing
+    listening" — the two demand opposite verdicts under a fail-closed policy.
     """
     try:
         import psutil
@@ -280,9 +288,19 @@ def _listener_pids(port: int) -> list[int]:
                 and conn.pid
             ):
                 pids.add(conn.pid)
-        return sorted(pids)
+        return sorted(pids), True
     except Exception:
-        return []
+        return [], False
+
+
+def _port_bindable(port: int) -> bool:
+    """True when 127.0.0.1:<port> can still be bound (nothing is listening)."""
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
 
 
 def _owned_pids(root_pid: int) -> set[int]:
@@ -313,7 +331,7 @@ def _run_start_phase(
     # our readiness, and Eleventy-class dev servers silently advance to the
     # next free port when the requested one is taken — which is how a stale
     # listener manufactured false "ready" verdicts and orphaned servers.
-    existing = _listener_pids(port)
+    existing, inspected = _listener_pids(port)
     if existing:
         return ReadinessResult(
             url=url,
@@ -323,6 +341,19 @@ def _run_start_phase(
             error=(
                 f"port {port} already in use (listener pid "
                 f"{', '.join(str(p) for p in existing)}); refusing to start"
+            ),
+        )
+    if not inspected and not _port_bindable(port):
+        # Listener table unreadable (e.g. non-root macOS) but the port is
+        # taken — refuse rather than spawn against an unidentifiable listener.
+        return ReadinessResult(
+            url=url,
+            ready=False,
+            status_code=None,
+            duration=time.monotonic() - started,
+            error=(
+                f"port {port} already in use (listener PID unavailable: "
+                "cannot inspect connections on this platform); refusing to start"
             ),
         )
 
@@ -350,24 +381,53 @@ def _run_start_phase(
             # unrelated process binding between our preflight and now, or a
             # server that silently relocated to another port) must fail
             # readiness, never pass it.
-            listeners = _listener_pids(port)
-            owned = _owned_pids(proc.pid)
-            if not listeners or not set(listeners).issubset(owned):
+            listeners, inspected = _listener_pids(port)
+            if inspected:
+                owned = _owned_pids(proc.pid)
+                if not listeners or not set(listeners).issubset(owned):
+                    ready, status = False, None
+                    error = (
+                        f"listener on port {port} not owned by started process "
+                        f"(listener pids {listeners}, owned pids {sorted(owned)})"
+                    )
+            elif _port_bindable(port):
+                # Nothing is listening anymore yet HTTP just answered — the
+                # server died between the poll and this check.
+                ready, status = False, None
+                error = f"listener on port {port} disappeared during readiness check"
+            else:
+                # Something is listening but this platform won't tell us
+                # whose it is; ownership cannot be proven, so fail closed.
                 ready, status = False, None
                 error = (
-                    f"listener on port {port} not owned by started process "
-                    f"(listener pids {listeners}, owned pids {sorted(owned)})"
+                    f"cannot prove ownership of the listener on port {port} "
+                    "(connection inspection unavailable on this platform); "
+                    "failing closed"
                 )
     finally:
         # Reap the whole owned tree — killing only the direct shell leaves
         # grandchildren (npm → cmd → eleventy) alive holding the stdout pipe.
-        terminate_process_tree(identity)
+        reap = terminate_process_tree(identity)
+        wait_hung = False
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            pass
+            wait_hung = True
         # Bounded reader shutdown; the daemon thread can never hang us.
         drain.wait(timeout=5.0)
+        if ready and (
+            reap.status.value not in ("terminated", "already_exited") or wait_hung
+        ):
+            # The app answered, but we could not prove the tree is gone —
+            # reporting success here is exactly the orphaned-server incident.
+            ready = False
+            status = None
+            error = (
+                f"teardown failed after readiness "
+                f"(reap={reap.status.value}"
+                f"{': ' + reap.detail if reap.detail else ''}, "
+                f"wrapper_wait={'timeout' if wait_hung else 'ok'})"
+            )
     return ReadinessResult(
         url=url,
         ready=ready,

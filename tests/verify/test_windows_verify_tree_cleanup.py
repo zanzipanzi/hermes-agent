@@ -98,10 +98,47 @@ def _read_marker(marker: Path, timeout: float = 10.0) -> int:
     pytest.fail(f"fixture parent never wrote its child PID to {marker}")
 
 
-def _reap_all_fixtures() -> None:
+def _reap_all_fixtures(*markers) -> None:
+    """Tear down only verifiably-owned fixture trees (see module docstring).
+
+    A process is signalled only when its own command line proves ownership:
+    the wrapper/parent's cmdline contains one of this test's unique marker
+    paths (or the tmp_path that scopes them), or a marker-file PID is alive
+    AND carries the ``# vpt-marker`` child tag — a recycled PID fails the
+    tag check and is left alone. Generic fixture-path scanning stays
+    detection-only (``_fixture_proc_pids``) and never kills.
+    """
     import psutil
 
-    for pid in _fixture_proc_pids():
+    marker_paths = {str(m) for m in markers if m is not None}
+    marker_files = [m for m in markers if m is not None and m.is_file()]
+    targets: list[int] = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = " ".join(proc.info["cmdline"] or [])
+        except Exception:
+            continue
+        if any(path in cmdline for path in marker_paths) and proc.info["pid"] != 0:
+            targets.append(proc.info["pid"])
+    for marker in marker_files:
+        try:
+            child_pid = int(marker.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if child_pid in targets:
+            continue
+        try:
+            cmdline = " ".join(psutil.Process(child_pid).cmdline() or [])
+        except Exception:
+            cmdline = ""
+        if "# vpt-marker" in cmdline:
+            targets.append(child_pid)
+        elif psutil.pid_exists(child_pid):
+            print(
+                f"NOTE: marker pid {child_pid} is alive but not verifiably "
+                "ours (cmdline mismatch) — left untouched"
+            )
+    for pid in targets:
         try:
             if psutil.pid_exists(pid):
                 terminate_process_tree(capture_process_identity(pid))
@@ -138,7 +175,7 @@ class TestWindowsTreeCleanup:
             )
             assert _listener_pids(port) == [], "port must be freed after teardown"
         finally:
-            _reap_all_fixtures()
+            _reap_all_fixtures(marker)
 
     def test_readiness_timeout_removes_nested_tree(self, tmp_path):
         marker = tmp_path / "child_pid.txt"
@@ -148,7 +185,7 @@ class TestWindowsTreeCleanup:
                 tmp_path,
                 Recipe(name="x", start=_tree_command(marker), port=port),
                 phases=("start",),
-                ready_timeout=2.0,
+                ready_timeout=3.0,
             )
             assert result.readiness is not None
             assert not result.readiness.ready
@@ -158,7 +195,7 @@ class TestWindowsTreeCleanup:
             )
             assert _wait_until(lambda: not _fixture_proc_pids(), timeout=15.0)
         finally:
-            _reap_all_fixtures()
+            _reap_all_fixtures(marker)
 
     def test_phase_timeout_removes_nested_tree(self, tmp_path):
         marker = tmp_path / "child_pid.txt"
@@ -166,7 +203,7 @@ class TestWindowsTreeCleanup:
             result = run_verify(
                 tmp_path,
                 Recipe(name="x", test=[_tree_command(marker)]),
-                phase_timeout=2.0,
+                phase_timeout=3.0,
                 skip_start=True,
             )
             phase = result.phases[0]
@@ -178,7 +215,7 @@ class TestWindowsTreeCleanup:
             )
             assert _wait_until(lambda: not _fixture_proc_pids(), timeout=15.0)
         finally:
-            _reap_all_fixtures()
+            _reap_all_fixtures(marker)
 
     def test_preexisting_listener_preserved_and_fail_closed_before_spawn(
         self, tmp_path
@@ -225,7 +262,7 @@ class TestWindowsTreeCleanup:
         finally:
             server.shutdown()
             thread.join(timeout=5)
-            _reap_all_fixtures()
+            _reap_all_fixtures(marker)
 
     def test_twenty_cycles_leave_zero_descendants_and_listeners(self, tmp_path):
         used_ports: list[int] = []
@@ -263,4 +300,4 @@ class TestWindowsTreeCleanup:
             assert leaked_listeners == []
             assert _fixture_proc_pids() == []
         finally:
-            _reap_all_fixtures()
+            _reap_all_fixtures(tmp_path)

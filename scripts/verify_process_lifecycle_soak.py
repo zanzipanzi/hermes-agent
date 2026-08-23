@@ -111,13 +111,49 @@ def _wait_until(predicate, timeout: float, interval: float = 0.05) -> bool:
     return predicate()
 
 
-def _cleanup_owned(unowned_counter: list[int]) -> None:
-    """Kill only verifiably-owned fixtures, recording PID + start time first."""
-    for pid, _cmdline in _fixture_procs():
+def _cleanup_owned(unowned_counter: list[int], workdir: Path) -> None:
+    """Kill only verifiably-owned fixtures, never by generic text match.
+
+    Ownership proof: the process's own command line contains this soak run's
+    unique temporary workdir path (wrappers/parents), or a marker-file PID is
+    alive AND carries the ``# vpt-marker`` child tag (a recycled PID fails
+    the tag check and is reported, never signalled). The global fixture scan
+    is detection-only evidence.
+    """
+    import psutil
+
+    needle = str(workdir)
+    targets: list[int] = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = " ".join(proc.info["cmdline"] or [])
+        except Exception:
+            continue
+        if needle in cmdline and proc.info["pid"] != 0:
+            targets.append(proc.info["pid"])
+    for marker in sorted(workdir.glob("cycle_*_child.txt")):
+        try:
+            child_pid = int(marker.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if child_pid in targets:
+            continue
+        try:
+            cmdline = " ".join(psutil.Process(child_pid).cmdline() or [])
+        except Exception:
+            cmdline = ""
+        if "# vpt-marker" in cmdline:
+            targets.append(child_pid)
+        elif psutil.pid_exists(child_pid):
+            print(
+                f"  cleanup: NOTE pid {child_pid} from {marker.name} is alive "
+                "but not verifiably ours (cmdline mismatch) — left untouched"
+            )
+    for pid in targets:
         identity = capture_process_identity(pid)
         print(f"  cleanup: terminating fixture pid={pid} start_time={identity.start_time}")
         result = terminate_process_tree(identity)
-        if result.status.value != "terminated" and result.status.value != "already_exited":
+        if result.status.value not in ("terminated", "already_exited"):
             unowned_counter[0] += 1
             print(f"  cleanup: WARNING pid {pid} -> {result.status.value}: {result.detail}")
 
@@ -163,7 +199,7 @@ def main() -> int:
                 entry["verdict"] = "READY_FAIL"
                 evidence.append(entry)
                 print(f"cycle {cycle}: NOT READY on port {port}: {entry['error']}")
-                _cleanup_owned(unowned_processes_touched)
+                _cleanup_owned(unowned_processes_touched, workdir)
                 return _fail(evidence, args, leaked_processes, leaked_listeners,
                              unowned_processes_touched[0])
 
@@ -182,7 +218,7 @@ def main() -> int:
                     leaked_processes += 1
                     evidence.append(entry)
                     print(f"cycle {cycle}: LEAK child pid {child_pid} still alive")
-                    _cleanup_owned(unowned_processes_touched)
+                    _cleanup_owned(unowned_processes_touched, workdir)
                     return _fail(evidence, args, leaked_processes, leaked_listeners,
                                  unowned_processes_touched[0])
 
@@ -195,7 +231,7 @@ def main() -> int:
                 leaked_processes += len(survivors)
                 evidence.append(entry)
                 print(f"cycle {cycle}: LEAK fixture survivors: {survivors}")
-                _cleanup_owned(unowned_processes_touched)
+                _cleanup_owned(unowned_processes_touched, workdir)
                 return _fail(evidence, args, leaked_processes, leaked_listeners,
                              unowned_processes_touched[0])
 
@@ -205,7 +241,7 @@ def main() -> int:
                 leaked_listeners += 1
                 evidence.append(entry)
                 print(f"cycle {cycle}: LEAK port {port} still listening")
-                _cleanup_owned(unowned_processes_touched)
+                _cleanup_owned(unowned_processes_touched, workdir)
                 return _fail(evidence, args, leaked_processes, leaked_listeners,
                              unowned_processes_touched[0])
 
@@ -222,7 +258,7 @@ def main() -> int:
             leaked_processes += len(_fixture_procs())
             print(f"final: fixture survivors: {_fixture_procs()}")
     finally:
-        _cleanup_owned(unowned_processes_touched)
+        _cleanup_owned(unowned_processes_touched, workdir)
         if args.receipt:
             args.receipt.write_text(
                 json.dumps(

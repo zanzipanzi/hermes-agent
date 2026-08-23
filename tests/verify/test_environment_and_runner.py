@@ -318,10 +318,13 @@ def _wait_until_pid_gone(pid: int, timeout: float, interval: float = 0.05) -> bo
 def _reap_fixture_processes(marker: Path) -> None:
     """Best-effort teardown of only this test's fixture tree (see block doc).
 
-    Kills only processes whose own command line proves ownership: the
-    fixture-script path (wrappers/parents) or the embedded ``vpt-marker``
-    tag (children). Marker-file PIDs are never signalled blindly — Windows
-    recycles PIDs, and a recycled number must never be killed.
+    A process is signalled only when ownership is proven by its own command
+    line: the wrapper/parent's cmdline contains this test's unique marker
+    path (tmp_path-scoped, so no concurrent run or editor can match it), or
+    a marker-file PID is still alive AND its cmdline carries the fixture's
+    ``# vpt-marker`` child tag (recycled PIDs fail this check and are left
+    alone). Generic fixture-path scans are detection-only — reported,
+    never killed.
     """
     import psutil
     from tools.process_lifecycle import (
@@ -329,15 +332,31 @@ def _reap_fixture_processes(marker: Path) -> None:
         terminate_process_tree,
     )
 
-    needles = (str(marker), "# vpt-marker", "verify_process_tree.py")
     targets: list[int] = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
             cmdline = " ".join(proc.info["cmdline"] or [])
         except Exception:
             continue
-        if any(n in cmdline for n in needles) and proc.info["pid"] != 0:
+        if str(marker) in cmdline and proc.info["pid"] != 0:
             targets.append(proc.info["pid"])
+    if marker.exists():
+        try:
+            child_pid = int(marker.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            child_pid = None
+        if child_pid is not None and child_pid not in targets:
+            try:
+                cmdline = " ".join(psutil.Process(child_pid).cmdline() or [])
+            except Exception:
+                cmdline = ""
+            if "# vpt-marker" in cmdline:
+                targets.append(child_pid)
+            elif psutil.pid_exists(child_pid):
+                print(
+                    f"NOTE: marker pid {child_pid} is alive but not verifiably "
+                    "ours (cmdline mismatch) — left untouched"
+                )
     for pid in targets:
         try:
             if psutil.pid_exists(pid):
@@ -352,7 +371,7 @@ class TestPhaseTimeoutTreeReaping:
         recipe = Recipe(name="x", test=[_fixture_tree_command(marker)])
         try:
             result = run_verify(
-                tmp_path, recipe, phase_timeout=2.0, skip_start=True
+                tmp_path, recipe, phase_timeout=3.0, skip_start=True
             )
             phase = result.phases[0]
             assert phase.timed_out
@@ -371,7 +390,7 @@ class TestPhaseTimeoutTreeReaping:
         )
         try:
             result = run_verify(
-                tmp_path, recipe, phase_timeout=2.0, skip_start=True
+                tmp_path, recipe, phase_timeout=3.0, skip_start=True
             )
             phase = result.phases[0]
             assert phase.timed_out
