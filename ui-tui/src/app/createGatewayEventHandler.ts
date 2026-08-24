@@ -804,6 +804,23 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
+        if (p.kind === 'compacting') {
+          // Auto-compaction can take minutes (97-175s observed). The generic
+          // four-second status restore must not clear the indicator while it
+          // is still running; a follow-up non-compacting status ends it.
+          sys(p.text)
+          if (!getUiState().compactionStartedAt) {
+            patchUiState({ compactionStartedAt: Date.now() })
+          }
+          turnController.clearStatusTimer()
+
+          return
+        }
+
+        if (getUiState().compactionStartedAt) {
+          patchUiState({ compactionStartedAt: 0 })
+        }
+
         if (!p.kind || p.kind === 'status') {
           return
         }

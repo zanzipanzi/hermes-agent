@@ -1981,4 +1981,51 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
   })
+
+  describe('compaction status visibility (Lane B2)', () => {
+    it('retains the compacting status past the generic 4s restore and exposes elapsed state', () => {
+      vi.useFakeTimers()
+      try {
+        const appended: Msg[] = []
+        const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+        onEvent({ payload: {}, type: 'message.start' } as any)
+        onEvent({ payload: { kind: 'compacting', text: '⠋ Compacting conversation…' }, type: 'status.update' } as any)
+
+        expect(getUiState().status).toContain('Compacting')
+        expect(getUiState().compactionStartedAt).toBeGreaterThan(0)
+        // The generic 4-second status timer must NOT be armed for compaction.
+        expect(turnController.statusTimer).toBeNull()
+
+        vi.advanceTimersByTime(10_000)
+        // Still compacting: only a follow-up status ends it.
+        expect(getUiState().status).toContain('Compacting')
+        expect(getUiState().compactionStartedAt).toBeGreaterThan(0)
+
+        onEvent({ payload: { kind: 'status', text: 'running…' }, type: 'status.update' } as any)
+        expect(getUiState().status).toBe('running…')
+        expect(getUiState().compactionStartedAt).toBe(0)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('keeps compaction status distinct from process/tool statuses', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+
+      onEvent({ payload: { kind: 'process', text: 'process 123 started' }, type: 'status.update' } as any)
+      expect(getUiState().status).toBe('process 123 started')
+      expect(getUiState().compactionStartedAt).toBe(0)
+      expect(turnController.statusTimer).not.toBeNull() // generic restore armed
+
+      turnController.clearStatusTimer()
+
+      onEvent({ payload: { kind: 'compacting', text: '⠋ Compacting conversation…' }, type: 'status.update' } as any)
+      expect(getUiState().status).toContain('Compacting')
+      expect(turnController.statusTimer).toBeNull() // compaction never auto-restores
+    })
+  })
 })

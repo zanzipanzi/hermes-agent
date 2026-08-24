@@ -322,6 +322,9 @@ export interface UiState {
   busy: boolean
   busyInputMode: BusyInputMode
   compact: boolean
+  // Epoch ms while a context compaction is actively running, else 0. Lets the
+  // status bar show elapsed time and outlive the generic 4s status restore.
+  compactionStartedAt: number
   detailsMode: DetailsMode
   detailsModeCommandOverride: boolean
   // Focus view (/focus) — display-only reduced-output mode. Drives the

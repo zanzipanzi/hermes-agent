@@ -2440,6 +2440,9 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = 0
         self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
+        # Epoch seconds while a compaction is actively running, else None
+        # (see compress()). Read by usage payloads for elapsed-time display.
+        self.compaction_started_at = None
 
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
@@ -6160,6 +6163,33 @@ This compaction should PRIORITISE preserving all information related to the focu
         return merged
 
     def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: Optional[int] = None,
+        focus_topic: Optional[str] = None,
+        force: bool = False,
+        memory_context: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Public compaction entrypoint; brackets the run with a timestamp.
+
+        ``compaction_started_at`` is set for the whole duration (including
+        every early return and exception in the implementation below) so
+        usage payloads and the TUI can show an active compaction with
+        elapsed time, and is cleared the moment it finishes.
+        """
+        self.compaction_started_at = time.time()
+        try:
+            return self._compress_impl(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+                force=force,
+                memory_context=memory_context,
+            )
+        finally:
+            self.compaction_started_at = None
+
+    def _compress_impl(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: Optional[int] = None,

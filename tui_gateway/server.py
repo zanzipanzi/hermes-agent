@@ -4977,6 +4977,30 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+        # Effective context policy — what the runtime actually does, not just
+        # what config.yaml says: engine name, effective vs configured
+        # compression threshold, whether Codex autoraise raised it, and an
+        # active compaction with elapsed time (Lane B visibility).
+        try:
+            usage["context_engine"] = str(getattr(comp, "name", None) or "compressor")
+            usage["context_threshold_tokens"] = int(
+                getattr(comp, "threshold_tokens", 0) or 0
+            )
+            _eff_pct = float(getattr(comp, "threshold_percent", 0) or 0)
+            usage["context_threshold_percent"] = round(_eff_pct * 100, 1)
+            _cfg_pct = getattr(comp, "_configured_threshold_percent", None)
+            usage["context_threshold_configured_percent"] = (
+                round(float(_cfg_pct) * 100, 1) if _cfg_pct else None
+            )
+            usage["context_threshold_autoraised"] = bool(
+                getattr(agent, "_compression_threshold_autoraised", None)
+            )
+            _started = getattr(comp, "compaction_started_at", None)
+            if _started:
+                usage["compaction_started_at"] = _started
+                usage["compaction_elapsed_seconds"] = round(time.time() - _started, 1)
+        except Exception:
+            pass
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
     # bar's ⛓ indicator; sourced from the same async_delegation registry.
@@ -12615,6 +12639,34 @@ def _format_live_usage_output(session: dict) -> str:
             f"{int(usage.get('context_max') or 0):,} "
             f"({int(usage.get('context_percent') or 0)}%)"
         )
+    engine = usage.get("context_engine")
+    if engine:
+        lines.append(f"Context engine:               {engine}")
+    eff_pct = usage.get("context_threshold_percent")
+    thr_tokens = int(usage.get("context_threshold_tokens") or 0)
+    cfg_pct = usage.get("context_threshold_configured_percent")
+    if eff_pct is not None and thr_tokens:
+        if cfg_pct is not None and cfg_pct != eff_pct:
+            autoraise_note = (
+                " (codex autoraised)"
+                if usage.get("context_threshold_autoraised")
+                else ""
+            )
+            lines.append(
+                "Compression threshold:        "
+                f"{cfg_pct:.0f}% configured → {eff_pct:.0f}% effective "
+                f"({thr_tokens:,} tokens){autoraise_note}"
+            )
+        else:
+            lines.append(
+                "Compression threshold:        "
+                f"{eff_pct:.0f}% ({thr_tokens:,} tokens)"
+            )
+    compaction_elapsed = usage.get("compaction_elapsed_seconds")
+    if compaction_elapsed is not None:
+        lines.append(
+            f"Compaction:                   running ({compaction_elapsed:.0f}s elapsed)"
+        )
     lines.extend(
         [
             f"Messages:                     {message_count:,}",
@@ -12710,6 +12762,28 @@ def _format_live_context_output(session: dict) -> str:
             lines.append(f"Context usage: ~{context_used:,} tokens")
     if usage.get("compressions"):
         lines.append(f"Compressions: {int(usage.get('compressions') or 0):,}")
+    engine = usage.get("context_engine")
+    if engine:
+        lines.append(f"Context engine: {engine}")
+    eff_pct = usage.get("context_threshold_percent")
+    thr_tokens = int(usage.get("context_threshold_tokens") or 0)
+    cfg_pct = usage.get("context_threshold_configured_percent")
+    if eff_pct is not None and thr_tokens:
+        if cfg_pct is not None and cfg_pct != eff_pct:
+            autoraise_note = (
+                " (codex autoraised)"
+                if usage.get("context_threshold_autoraised")
+                else ""
+            )
+            lines.append(
+                f"Compression threshold: {cfg_pct:.0f}% configured → "
+                f"{eff_pct:.0f}% effective ({thr_tokens:,} tokens){autoraise_note}"
+            )
+        else:
+            lines.append(f"Compression threshold: {eff_pct:.0f}% ({thr_tokens:,} tokens)")
+    compaction_elapsed = usage.get("compaction_elapsed_seconds")
+    if compaction_elapsed is not None:
+        lines.append(f"Compaction: running ({compaction_elapsed:.0f}s elapsed)")
     return "\n".join(lines)
 
 
