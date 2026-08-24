@@ -163,6 +163,17 @@ CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "session or /compress to retry immediately."
 )
 
+# Non-destructive context-health advisory (Lane B3): fires once when
+# current-window occupancy first crosses the advisory band below the
+# effective threshold. Suggests actions; never takes them automatically.
+CONTEXT_HEALTH_ADVISORY_TEMPLATE = (
+    "ℹ️ Context: ~{tokens:,} tokens approaching the effective compression "
+    "threshold of {threshold:,}{autoraise_note} ({percent:.0f}%). "
+    "Consider /context to inspect usage, /compress to compact now, "
+    "checkpointing important state, or starting a fresh mission session. "
+    "Nothing is deleted or rotated automatically."
+)
+
 # Sample-formatted instances of every routine compression status line, for
 # behavioral tests that iterate the ACTUAL emitted wording (formatted from the
 # same constants the emission sites use) through the gateway noise filter.

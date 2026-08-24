@@ -1041,6 +1041,62 @@ class AIAgent:
         """
         self._last_ctx_overflow_warn = None
 
+    def _maybe_advise_context_health(self) -> None:
+        """One-shot advisory when context occupancy nears the threshold.
+
+        Non-destructive by contract (Lane B3): it only *suggests* — /context,
+        /compress, checkpointing, or a fresh mission session. It never
+        auto-runs /new, never deletes history, and never forces compression.
+
+        Uses the compressor's real current-window occupancy
+        (``last_prompt_tokens``), never cumulative lifetime totals — a huge
+        ``session_total_tokens`` with an empty window is history, not a
+        problem. Fires once per band crossing; re-arms only after occupancy
+        falls back below the band (e.g. a compression shrank the window).
+        """
+        comp = getattr(self, "context_compressor", None)
+        if comp is None:
+            return
+        threshold_tokens = getattr(comp, "threshold_tokens", 0) or 0
+        # Clamp the -1 "compression just ran" sentinel to 0 — unknown
+        # occupancy must not fire an advisory.
+        last_prompt = getattr(comp, "last_prompt_tokens", 0) or 0
+        if last_prompt < 0:
+            last_prompt = 0
+        if not threshold_tokens or not last_prompt:
+            return
+        try:
+            advisory_ratio = float(
+                getattr(self, "context_advisory_ratio", 0.85) or 0.85
+            )
+        except (TypeError, ValueError):
+            advisory_ratio = 0.85
+        if advisory_ratio >= 1.0:
+            return  # explicitly disabled
+        advisory_tokens = int(threshold_tokens * advisory_ratio)
+        if last_prompt >= advisory_tokens:
+            if getattr(self, "_context_advisory_fired", False):
+                return
+            self._context_advisory_fired = True
+            from agent.conversation_compression import (
+                CONTEXT_HEALTH_ADVISORY_TEMPLATE,
+            )
+
+            autoraise = getattr(self, "_compression_threshold_autoraised", None)
+            autoraise_note = " (codex autoraised)" if autoraise else ""
+            self._emit_warning(
+                CONTEXT_HEALTH_ADVISORY_TEMPLATE.format(
+                    tokens=last_prompt,
+                    threshold=threshold_tokens,
+                    percent=(last_prompt / threshold_tokens) * 100,
+                    autoraise_note=autoraise_note,
+                )
+            )
+        else:
+            # Below the advisory band (typically right after a compression
+            # shrank the window): re-arm so the next crossing warns again.
+            self._context_advisory_fired = False
+
     def _emit_notice(self, notice) -> None:
         """Fire a structured ``AgentNotice`` to the active driver (TUI / CLI).
 

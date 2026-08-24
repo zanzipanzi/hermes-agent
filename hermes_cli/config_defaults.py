@@ -608,6 +608,13 @@ DEFAULT_CONFIG = {
                                       # floored at 0.75 (raise-only) so compaction
                                       # doesn't fire with half the window still free;
                                       # set this above 0.75 to override the floor.
+        "advisory_ratio": 0.85,       # non-destructive context-health advisory:
+                                      # when current-window occupancy crosses this
+                                      # fraction of the effective threshold, warn
+                                      # once (suggest /context, /compress,
+                                      # checkpoint, or a new session). Never
+                                      # auto-compresses or rotates. Set >= 1.0 to
+                                      # disable the advisory entirely.
         "threshold_tokens": None,     # absolute token cap — when set, compression
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to

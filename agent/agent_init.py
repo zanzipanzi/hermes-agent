@@ -1863,6 +1863,16 @@ def init_agent(
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
+    # Non-destructive context-health advisory band (Lane B3): fraction of the
+    # effective threshold at which a one-shot "approaching compression"
+    # suggestion fires. >= 1.0 disables it. Never triggers any action itself.
+    try:
+        agent.context_advisory_ratio = float(
+            _compression_cfg.get("advisory_ratio", 0.85)
+        )
+    except (TypeError, ValueError):
+        agent.context_advisory_ratio = 0.85
+    agent._context_advisory_fired = False
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
     # raise to 85% (the Codex backend caps both families at 272K, so the
     # default 50% would compact at ~136K — half the usable context). Gated by

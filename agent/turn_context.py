@@ -751,6 +751,17 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
+    # Lane B3: non-destructive context-health advisory. Consults the
+    # compressor's REAL current-window occupancy (last_prompt_tokens), warns
+    # once per advisory-band crossing, and re-arms below the band — so it
+    # must run on EVERY turn, not only when the preflight estimate gate
+    # opens. getattr guard: test doubles and drivers without the hook no-op.
+    _advise_fn = getattr(agent, "_maybe_advise_context_health", None)
+    if callable(_advise_fn):
+        try:
+            _advise_fn()
+        except Exception:
+            logger.debug("context-health advisory failed", exc_info=True)
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
