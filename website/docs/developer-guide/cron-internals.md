@@ -215,6 +215,38 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 
 This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
 
+### Foreground Servers and `hermes verify`
+
+A cron job must not start a foreground dev server unless its explicit
+purpose is to own that service and it has a durable stop contract. Dev
+servers (Eleventy, Vite, `npm run dev`) silently advance to the next free
+port when the requested one is taken, and an agent session that ends
+without a deterministic tree-kill leaves the whole
+`npm → cmd → server` tree orphaned — observed in production as twelve
+stray Eleventy instances manufactured by repeated unattended runs.
+
+Rules for job authors:
+
+- Health polling → use `monitor_url` or a stable `monitor_script` (hashed,
+  timestamp-free output), never a prompt that curls a server the job
+  itself starts.
+- Build/test verification → `hermes verify --skip-start`. Bare
+  `hermes verify` includes the *start* phase by default, which launches
+  the project's dev server — exactly the interactive path cron jobs must
+  not own. Runtime readiness checks are only for jobs whose explicit
+  purpose is to own that service, with a bounded start phase and a
+  recorded teardown.
+- Deterministic fixed-output watchdogs → a `script` job with
+  `no_agent=True`.
+- Prefer bounded project scripts (`npm run verify`, `npm run build`) over
+  ad-hoc server launches; an agent improvising
+  `hermes verify --phase start` to "check the site" is the canonical
+  incident pattern.
+- The inactivity timeout (`HERMES_CRON_TIMEOUT`) bounds *idle* time, not
+  wall time: a wedged server keeps no activity and is killed, but a
+  chatty orphaned server can outlive the job. Only exact-PID tree
+  teardown (never kill-by-name) makes the stop contract durable.
+
 ### Provider Recovery
 
 `run_job()` passes the user's configured fallback providers and credential pool into the `AIAgent` instance:

@@ -95,3 +95,37 @@ def test_human_report(tmp_path, capsys):
 def test_bad_path(tmp_path, capsys):
     code = run_verify_command(make_args(tmp_path / "nope"))
     assert code == 2
+
+
+def test_default_run_includes_start_phase(tmp_path, capsys):
+    """Bare ``hermes verify`` launches the dev server by default.
+
+    This pins the documented cron footgun (website/docs/developer-guide/
+    cron-internals.md): with neither ``--phase`` nor ``--skip-start`` the
+    start phase is selected, so unattended callers (cron jobs, agents
+    improvising a site check) get a foreground server they must own and
+    tear down. Scheduler-side jobs must pass ``--skip-start``; changing
+    this default is a behavior change that must update those docs.
+    """
+    from agent.verify.recipes import Recipe
+    from agent.verify.runner import run_verify as _run
+    from pathlib import Path
+
+    # run_verify is the decision point the CLI feeds; verify the selection
+    # contract directly (no real server spawn needed).
+    selected = _run(Path(tmp_path), Recipe(name="x", test=["true"]), skip_start=False).phases
+    assert [p.phase for p in selected] == ["test"], "explicit phases stay explicit"
+
+    full = _run(
+        Path(tmp_path),
+        Recipe(name="x", test=["true"], start="echo would-serve", port=1),
+        skip_start=False,
+    )
+    assert full.readiness is not None, "default (no phases) includes the start phase"
+
+    skipped = _run(
+        Path(tmp_path),
+        Recipe(name="x", test=["true"], start="echo would-serve", port=1),
+        skip_start=True,
+    )
+    assert skipped.readiness is None, "--skip-start must exclude the start phase"
