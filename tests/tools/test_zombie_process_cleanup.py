@@ -57,9 +57,14 @@ class TestZombieReproduction:
                 )
         finally:
             for pid in pids:
+                # Portable teardown: SIGKILL on POSIX, TerminateProcess via
+                # psutil on Windows (which has no SIGKILL).
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
+                    import psutil
+                    psutil.Process(pid).kill()
+                except psutil.NoSuchProcess:
+                    pass
+                except (ProcessLookupError, PermissionError, OSError):
                     pass
 
     def test_explicit_terminate_reaps_processes(self):

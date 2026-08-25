@@ -552,7 +552,12 @@ class TestKanbanWaitpidWindowsGuard:
         #   `if os.name == "nt": return []` (early-return guard).
         # Both correctly keep the waitpid loop off Windows; the early-return
         # form is stronger because the rest of the function never runs.
-        preamble = source[max(0, idx - 400):idx]
+        # Search from the enclosing function's start, not a fixed char
+        # window: the Windows branch body between the guard and the waitpid
+        # call can exceed 400 chars, which made a correctly guarded
+        # implementation fail this check on POSIX-literal windows.
+        fn_start = source.rfind("def reap_worker_zombies", 0, idx)
+        preamble = source[max(0, fn_start if fn_start != -1 else idx - 400):idx]
         guard_patterns = (
             'os.name != "nt"',
             "os.name != 'nt'",

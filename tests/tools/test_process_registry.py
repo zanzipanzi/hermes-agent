@@ -491,6 +491,11 @@ class TestStdinHelpers:
         proc.stdin.close.assert_called_once()
         assert result["status"] == "ok"
 
+    @pytest.mark.xfail(
+        sys.platform == "win32",
+        reason="winpty: close_stdin does not deliver EOF to a child blocked "
+        "in stdin.read(); PTY EOF semantics gap on Windows",
+    )
     def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
         """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
 
@@ -735,6 +740,11 @@ class TestSpawnEnvSanitization:
 class TestPopenLeakOnSetupFailure:
     """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="forces the POSIX os.getpgid fallback path; Windows teardown "
+        "is taskkill-based (see TestTerminateHostPidWindows)",
+    )
     def test_popen_killed_when_thread_creation_fails(self, registry):
         """If Thread() raises after Popen, proc must be killed — not orphaned."""
         killed = []
@@ -935,6 +945,11 @@ class TestKillProcess:
         assert result["status"] == "already_exited"
 
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX branch expects psutil terminate(); Windows detached "
+        "kills go through taskkill /T /F (TestTerminateHostPidWindows)",
+    )
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242

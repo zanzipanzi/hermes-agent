@@ -60,36 +60,33 @@ def _is_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:
-    """Best-effort SIGTERM-then-SIGKILL of the child's process group.
+    """Terminate the real child's whole tree via the shared lifecycle seam.
 
-    This module only ever runs on POSIX (the wrap site in tools/mcp_tool.py
-    gates on ``os.name == "posix"``), but guard the POSIX-only primitives
-    anyway so an accidental Windows import/execute degrades to a plain
-    child kill instead of AttributeError.
+    Historically a private SIGTERM-then-SIGKILL of the child's process group;
+    now delegates to ``tools.process_lifecycle.terminate_process_tree`` so
+    every owned-tree teardown in Hermes shares one implementation
+    (children-first SIGTERM, bounded grace, SIGKILL escalation; on Windows
+    the same call is an exact-PID ``taskkill /T /F``). The child is spawned
+    with ``start_new_session`` so its group equals its tree. The import is
+    lazy: this supervisor's startup stays stdlib-only and fast, and the seam
+    is only pulled in at teardown time.
     """
-    killpg = getattr(os, "killpg", None)
-    if killpg is None:  # windows-footgun: ok — non-POSIX fallback
+    try:
+        from tools.process_lifecycle import ProcessIdentity, terminate_process_tree
+    except Exception:
+        # Standalone execution outside a Hermes install — degrade to the old
+        # best-effort plain child kill.
         try:
             proc.terminate()
             proc.wait(timeout=_TERM_GRACE_S)
         except (OSError, subprocess.TimeoutExpired):
             proc.kill()
         return
+    terminate_process_tree(ProcessIdentity(pid=proc.pid), grace_seconds=_TERM_GRACE_S)
     try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, OSError):
-        return
-    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-    for sig in (signal.SIGTERM, sigkill):
-        try:
-            killpg(pgid, sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            return
-        try:
-            proc.wait(timeout=_TERM_GRACE_S)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+        proc.wait(timeout=_TERM_GRACE_S + 2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def _watchdog_loop(proc: subprocess.Popen, original_ppid: int) -> None:
