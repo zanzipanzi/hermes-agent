@@ -694,7 +694,12 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _make_redirect_handler(port: int, redirect_uri: str | None = None):
+def _make_redirect_handler(
+    port: int,
+    redirect_uri: str | None = None,
+    *,
+    storage: "HermesTokenStorage | None" = None,
+):
     """Return a redirect handler closure that closes over the given port.
 
     Using a closure instead of reading the module-level ``_oauth_port`` avoids
@@ -706,6 +711,13 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     hint: a proxied callback reaches this machine on its own, so the loopback
     SSH-tunnel guidance would be misleading.
     """
+    # A failed refresh can send the same long-lived provider through this
+    # handler on every MCP reconnect. Reserve one prompt per token-file epoch;
+    # only a successful token write permits a future authorization prompt.
+    # A fresh explicit `hermes mcp login` builds a new handler.
+    last_prompt_epoch: object | int | None = object()
+    prompt_lock = threading.Lock()
+
     async def _redirect_handler(authorization_url: str) -> None:
         """Show the authorization URL to the user.
 
@@ -733,6 +745,19 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
             "MCP OAuth requires browser authorization but no interactive "
             "session is available (non-interactive/background context)."
         )
+        nonlocal last_prompt_epoch
+        try:
+            epoch = storage._tokens_path().stat().st_mtime_ns if storage else None
+        except OSError:
+            epoch = None
+        with prompt_lock:
+            if last_prompt_epoch == epoch:
+                raise OAuthNonInteractiveError(
+                    "MCP OAuth authorization already requested for this token "
+                    "version; complete the existing browser flow or run "
+                    "`hermes mcp login <server>` explicitly."
+                )
+            last_prompt_epoch = epoch
 
         msg = (
             f"\n  MCP OAuth: authorization required.\n"
@@ -1355,7 +1380,8 @@ def build_oauth_auth(
     # Use closure factories to avoid global state pollution (#44588, #34260).
     resolved_port = cfg.get("_resolved_port", _oauth_port)
     redirect_handler = _make_redirect_handler(
-        resolved_port, redirect_uri=cfg.get("redirect_uri") or None
+        resolved_port, redirect_uri=cfg.get("redirect_uri") or None,
+        storage=storage,
     )
     callback_handler = _make_callback_waiter(resolved_port)
 

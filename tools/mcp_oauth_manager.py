@@ -573,7 +573,7 @@ class MCPOAuthManager:
         _maybe_preregister_client(storage, cfg, client_metadata)
 
         resolved_port = cfg.get("_resolved_port", 0)
-        redirect_handler = _make_redirect_handler(resolved_port)
+        redirect_handler = _make_redirect_handler(resolved_port, storage=storage)
         callback_handler = _make_callback_waiter(resolved_port)
 
         return _HERMES_PROVIDER_CLS(

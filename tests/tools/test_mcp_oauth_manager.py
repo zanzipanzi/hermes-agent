@@ -74,6 +74,32 @@ def _set_interactive_stdin(monkeypatch, *, is_tty: bool = True) -> None:
     monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
 
 
+def test_manager_redirect_rearms_only_after_token_write(tmp_path, monkeypatch):
+    """The production provider must reset its prompt gate after real token storage changes."""
+    import asyncio
+    from tools import mcp_oauth
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    monkeypatch.setattr(mcp_oauth, "_can_open_browser", lambda: True)
+    opened = MagicMock(return_value=True)
+    monkeypatch.setattr(mcp_oauth.webbrowser, "open", opened)
+    provider = MCPOAuthManager().get_or_build_provider(
+        "linear", "https://mcp.linear.app/mcp", {}
+    )
+    assert provider is not None
+    redirect = provider.context.redirect_handler
+
+    asyncio.run(redirect("https://mcp.linear.app/authorize?state=before"))
+    token_file = tmp_path / "mcp-tokens" / "linear.json"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text('{"access_token":"new","token_type":"Bearer"}')
+    asyncio.run(redirect("https://mcp.linear.app/authorize?state=after"))
+
+    assert opened.call_count == 2
+
+
 def test_hermes_provider_subclass_exists():
     """HermesMCPOAuthProvider is defined and subclasses OAuthClientProvider."""
     from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS
