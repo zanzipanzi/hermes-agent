@@ -166,6 +166,25 @@ class TestUtilities:
         assert _can_open_browser() is True
 
 
+class TestRedirectHandlerBrowserStorm:
+    """A rejected refresh must not reopen a consent tab on every MCP retry."""
+
+    def test_repeated_redirect_opens_only_one_browser_tab(self, monkeypatch):
+        import tools.mcp_oauth as mod
+
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+        monkeypatch.setattr(mod, "_can_open_browser", lambda: True)
+        opened = MagicMock(return_value=True)
+        monkeypatch.setattr(mod.webbrowser, "open", opened)
+        handler = mod._make_redirect_handler(49302)
+
+        asyncio.run(handler("https://mcp.linear.app/authorize?state=first"))
+        with pytest.raises(OAuthNonInteractiveError, match="already requested"):
+            asyncio.run(handler("https://mcp.linear.app/authorize?state=second"))
+
+        opened.assert_called_once()
+
+
 class TestRedirectHandlerSshHint:
     """_make_redirect_handler must print an SSH tunnel hint on remote sessions."""
 
